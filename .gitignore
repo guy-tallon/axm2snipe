@@ -1,0 +1,22 @@
+# Binary
+axm2snipe
+
+# Config with secrets
+settings.yaml
+
+# Private keys
+*.pem
+
+# IDE / tools
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/

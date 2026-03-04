@@ -1,0 +1,94 @@
+# axm2snipe configuration
+# Copy this file to settings.yaml and fill in your values.
+
+abm:
+  # Apple Business Manager API credentials
+  # Generate these at https://business.apple.com (Settings > API)
+  client_id: "BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  key_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # Path to the private key PEM file downloaded from ABM
+  private_key: "./axm2snipe.pem"
+
+snipe_it:
+  # Snipe-IT instance URL (no trailing slash)
+  url: "https://snipe.example.com"
+  # API key from Admin > API Keys in Snipe-IT
+  api_key: "your-snipe-it-api-key"
+
+  # ID of "Apple" manufacturer in Snipe-IT
+  manufacturer_id: 1
+
+  # Default status label ID for newly created assets
+  default_status_id: 1
+
+  # Category IDs for auto-created asset models
+  computer_category_id: 2   # For Mac devices
+  mobile_category_id: 3     # For iPhone/iPad devices
+
+  # Custom fieldset ID to attach to newly created models
+  # This allows custom fields (like AppleCare data) to appear on assets
+  custom_fieldset_id: 1
+
+sync:
+  # Set to true to simulate without making changes
+  dry_run: false
+
+  # Ignore timestamps and always update Snipe-IT from ABM
+  force: false
+
+  # Enable rate limiting for API calls
+  rate_limit: true
+
+  # Only update existing assets, don't create new ones
+  # update_only: true
+
+  # Filter devices by product family. Leave empty to sync all.
+  # Valid values: Mac, iPhone, iPad, AppleTV, Watch, Vision
+  # product_families:
+  #   - Mac
+
+  # Set asset name to "Model (Color)"
+  # set_name: false
+
+  # Custom field mappings: Snipe-IT field name -> ABM attribute
+  # Left side: Snipe-IT DB column name (e.g. _snipeit_fieldname_1)
+  #            or standard Snipe-IT field (purchase_date, order_number)
+  # Right side: ABM attribute name (see list below)
+  #
+  # ABM device attributes:
+  #   serial_number, device_model, color, device_capacity, part_number,
+  #   product_family, product_type, order_number, order_date,
+  #   purchase_source, status, imei, meid, wifi_mac, bluetooth_mac,
+  #   ethernet_mac, eid, added_to_org, released_from_org, assigned_server
+  #
+  # AppleCare coverage (fetched per device):
+  #   applecare_status, applecare_agreement, applecare_description,
+  #   applecare_start, applecare_end, applecare_renewable, applecare_payment_type
+  #
+  # warranty_months is auto-calculated from purchase_date to applecare_end.
+  #
+  # Recommended Snipe-IT custom field types:
+  #   MAC Address          -> text, format: MAC
+  #   Color                -> text, format: ANY
+  #   Storage              -> text, format: ANY
+  #   Warranty End Date    -> text, format: DATE
+  #   AppleCare Status     -> radio, values: Active/Inactive/Expired
+  #   AppleCare Start Date -> text, format: DATE
+  #   AppleCare Renewable  -> listbox, format: BOOLEAN, values: true/false
+  #   AppleCare Payment    -> radio, values: Paid Up Front/Free/Included/None
+  #   Assigned MDM Server  -> text, format: ANY
+  #
+  # field_mapping:
+  #   _snipeit_mac_address_1: wifi_mac
+  #   _snipeit_storage_3: device_capacity
+  #   _snipeit_color_7: color
+  #   purchase_date: order_date
+  #   order_number: order_number
+  #   _snipeit_warranty_end_date_4: applecare_end
+  #   _snipeit_warranty_id_5: applecare_agreement
+  #   _snipeit_applecare_status_9: applecare_status
+  #   _snipeit_applecare_description_10: applecare_description
+  #   _snipeit_applecare_start_date_11: applecare_start
+  #   _snipeit_applecare_renewable_12: applecare_renewable
+  #   _snipeit_applecare_payment_type_13: applecare_payment_type
+  #   _snipeit_assigned_mdm_server_14: assigned_server
