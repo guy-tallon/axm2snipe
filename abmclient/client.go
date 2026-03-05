@@ -1,25 +1,76 @@
-// Package abmclient provides a flexible ABM API client that handles
-// Apple's inconsistent JSON types (e.g. MAC addresses returned as string
-// instead of []string). It uses the abm library only for authentication.
+// Package abmclient wraps the abm library's Client with axm2snipe-specific
+// logic: MDM server name resolution via device linkages, flattened AppleCare
+// coverage, and a simplified constructor.
 package abmclient
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/zchee/abm"
-	"golang.org/x/oauth2"
 )
 
-const baseURL = "https://api-business.apple.com"
+var log = logrus.New()
 
-// Client wraps an authenticated HTTP client for the ABM API.
+// SetLogLevel sets the logger level for the abmclient package.
+func SetLogLevel(level logrus.Level) {
+	log.SetLevel(level)
+}
+
+// retryTransport wraps an http.RoundTripper with retry logic for 429 responses.
+// This is needed because the abm library's PageIterator makes raw HTTP calls
+// that bypass the doJSONRequest retry logic.
+type retryTransport struct {
+	base       http.RoundTripper
+	maxRetries int
+	initial    time.Duration
+}
+
+func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	backoff := t.initial
+	var bodyBytes []byte
+	if req.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
+	for attempt := 0; ; attempt++ {
+		resp, err := t.base.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusTooManyRequests || attempt >= t.maxRetries {
+			return resp, nil
+		}
+		resp.Body.Close()
+		log.Debugf("Rate limited (429), retrying in %v (attempt %d/%d)", backoff, attempt+1, t.maxRetries)
+
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+
+		// Reset body for retry
+		if bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+	}
+}
+
+// Client wraps an abm.Client with axm2snipe-specific helpers.
 type Client struct {
-	http *http.Client
+	abm *abm.Client
 }
 
 // NewClient creates a new ABM client using the abm library for auth.
@@ -34,102 +85,29 @@ func NewClient(ctx context.Context, clientID, keyID, privateKey string) (*Client
 		return nil, fmt.Errorf("creating ABM token source: %w", err)
 	}
 
-	httpClient := oauth2.NewClient(ctx, ts)
+	httpClient := &http.Client{
+		Transport: &retryTransport{
+			base:       http.DefaultTransport,
+			maxRetries: 5,
+			initial:    2 * time.Second,
+		},
+	}
 
-	return &Client{http: httpClient}, nil
+	client, err := abm.NewClient(httpClient, ts)
+	if err != nil {
+		return nil, fmt.Errorf("creating ABM client: %w", err)
+	}
+
+	return &Client{abm: client}, nil
 }
 
-// StringOrStrings handles ABM fields that may be a string or []string.
-type StringOrStrings []string
-
-func (s *StringOrStrings) UnmarshalJSON(data []byte) error {
-	// Try array first
-	var arr []string
-	if err := json.Unmarshal(data, &arr); err == nil {
-		*s = arr
-		return nil
-	}
-	// Try single string
-	var str string
-	if err := json.Unmarshal(data, &str); err == nil {
-		if str != "" {
-			*s = []string{str}
-		} else {
-			*s = nil
-		}
-		return nil
-	}
-	return fmt.Errorf("cannot unmarshal %s into string or []string", string(data))
-}
-
-// Device represents an ABM organization device with flexible field types.
+// Device wraps an abm.OrgDevice with the resolved MDM server name.
 type Device struct {
-	ID            string            `json:"id"`
-	Type          string            `json:"type"`
-	Attributes    *DeviceAttributes `json:"attributes,omitempty"`
-	Relationships *struct {
-		AssignedServer *struct {
-			Data *struct {
-				ID   string `json:"id"`
-				Type string `json:"type"`
-			} `json:"data"`
-		} `json:"assignedServer"`
-	} `json:"relationships,omitempty"`
+	abm.OrgDevice
+	AssignedServer string `json:"assignedServerName,omitempty"`
 }
 
-// DeviceAttributes holds device attributes with flexible MAC/IMEI types.
-type DeviceAttributes struct {
-	AddedToOrgDateTime      time.Time        `json:"addedToOrgDateTime,omitempty"`
-	ReleasedFromOrgDateTime time.Time        `json:"releasedFromOrgDateTime,omitempty"`
-	Color                   string           `json:"color,omitempty"`
-	DeviceCapacity          string           `json:"deviceCapacity,omitempty"`
-	DeviceModel             string           `json:"deviceModel,omitempty"`
-	EID                     string           `json:"eid,omitempty"`
-	IMEI                    StringOrStrings  `json:"imei,omitempty"`
-	MEID                    StringOrStrings  `json:"meid,omitempty"`
-	WifiMacAddress          StringOrStrings  `json:"wifiMacAddress,omitempty"`
-	BluetoothMacAddress     StringOrStrings  `json:"bluetoothMacAddress,omitempty"`
-	EthernetMacAddress      StringOrStrings  `json:"ethernetMacAddress,omitempty"`
-	OrderDateTime           time.Time        `json:"orderDateTime,omitempty"`
-	OrderNumber             string           `json:"orderNumber,omitempty"`
-	PartNumber              string           `json:"partNumber,omitempty"`
-	ProductFamily           string           `json:"productFamily,omitempty"`
-	ProductType             string           `json:"productType,omitempty"`
-	PurchaseSourceType      string           `json:"purchaseSourceType,omitempty"`
-	PurchaseSourceID        string           `json:"purchaseSourceId,omitempty"`
-	SerialNumber            string           `json:"serialNumber,omitempty"`
-	Status                  string           `json:"status,omitempty"`
-	UpdatedDateTime         time.Time        `json:"updatedDateTime,omitempty"`
-	AssignedServer          string           `json:"-"` // populated from relationships
-}
-
-// IncludedResource represents an included JSON:API resource (e.g. MDM server).
-type IncludedResource struct {
-	ID         string `json:"id"`
-	Type       string `json:"type"`
-	Attributes struct {
-		ServerName string `json:"serverName,omitempty"`
-	} `json:"attributes"`
-}
-
-// DevicesResponse is the paginated response from GET /v1/orgDevices.
-type DevicesResponse struct {
-	Data     []Device           `json:"data"`
-	Included []IncludedResource `json:"included,omitempty"`
-	Links    struct {
-		Self  string `json:"self"`
-		First string `json:"first,omitempty"`
-		Next  string `json:"next,omitempty"`
-	} `json:"links"`
-	Meta struct {
-		Paging struct {
-			Total int `json:"total"`
-			Limit int `json:"limit"`
-		} `json:"paging"`
-	} `json:"meta"`
-}
-
-// AppleCareCoverage holds AppleCare coverage data.
+// AppleCareCoverage holds flattened AppleCare coverage data for easy access in sync.
 type AppleCareCoverage struct {
 	AgreementNumber        string    `json:"agreementNumber,omitempty"`
 	ContractCancelDateTime time.Time `json:"contractCancelDateTime,omitempty"`
@@ -142,129 +120,131 @@ type AppleCareCoverage struct {
 	Status                 string    `json:"status,omitempty"`
 }
 
-// AppleCareCoverageResponse is the response from the AppleCare endpoint.
-type AppleCareCoverageResponse struct {
-	Data []struct {
-		ID         string             `json:"id"`
-		Type       string             `json:"type"`
-		Attributes *AppleCareCoverage `json:"attributes,omitempty"`
-	} `json:"data"`
+// ConnectionTest fetches a single device to verify the ABM connection.
+// Returns the total device count.
+func (c *Client) ConnectionTest(ctx context.Context) (int, error) {
+	resp, err := c.abm.GetOrgDevices(ctx, &abm.GetOrgDevicesOptions{Limit: 1})
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	if resp.Meta != nil {
+		total = resp.Meta.Paging.Total
+	}
+	return total, nil
 }
 
-// GetDevices fetches a page of devices with the given limit, including assigned MDM server.
-func (c *Client) GetDevices(ctx context.Context, limit int) (*DevicesResponse, error) {
-	url := fmt.Sprintf("%s/v1/orgDevices?limit=%d", baseURL, limit)
-	return c.getDevicesFromURL(ctx, url)
+// GetMDMServers fetches all MDM servers and returns a map of server ID to name.
+func (c *Client) GetMDMServers(ctx context.Context) (map[string]string, error) {
+	resp, err := c.abm.GetMDMServers(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetching MDM servers: %w", err)
+	}
+	servers := make(map[string]string, len(resp.Data))
+	for _, s := range resp.Data {
+		if s.Attributes != nil {
+			servers[s.ID] = s.Attributes.ServerName
+		}
+	}
+	return servers, nil
 }
 
-// GetDevicesFromURL fetches devices from an absolute pagination URL.
-func (c *Client) GetDevicesFromURL(ctx context.Context, url string) (*DevicesResponse, error) {
-	return c.getDevicesFromURL(ctx, url)
-}
-
-func (c *Client) getDevicesFromURL(ctx context.Context, url string) (*DevicesResponse, error) {
-	body, err := c.doGet(ctx, url)
+// BuildDeviceServerMap fetches all MDM servers and their device linkages
+// to build a map from device ID to server name.
+func (c *Client) BuildDeviceServerMap(ctx context.Context) (map[string]string, error) {
+	serverNames, err := c.GetMDMServers(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var resp DevicesResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decoding devices response: %w", err)
+	log.Infof("Found %d MDM servers for device linkage resolution", len(serverNames))
+
+	deviceToServer := make(map[string]string)
+	for serverID, serverName := range serverNames {
+		resp, err := c.abm.GetMDMServerDeviceLinkages(ctx, serverID, &abm.GetMDMServerDeviceLinkagesOptions{Limit: 1000})
+		if err != nil {
+			log.WithError(err).WithField("server", serverName).Warn("Could not fetch device linkages for MDM server")
+			continue
+		}
+		for _, linkage := range resp.Data {
+			deviceToServer[linkage.ID] = serverName
+		}
+		log.Debugf("MDM server %q: %d device linkages", serverName, len(resp.Data))
+
+		if resp.Links.Next != "" {
+			log.Warnf("MDM server %q has more than 1000 device linkages; pagination not yet supported, some devices may not have server names resolved", serverName)
+		}
 	}
-	return &resp, nil
+	log.Infof("Built device-to-server map with %d entries", len(deviceToServer))
+	return deviceToServer, nil
 }
 
-// GetAllDevices fetches all devices, following pagination.
-// Resolves assigned MDM server names from included resources.
+// GetAllDevices fetches all devices, resolves assigned MDM server names.
 func (c *Client) GetAllDevices(ctx context.Context) ([]Device, int, error) {
-	var all []Device
-	serverNames := make(map[string]string) // server ID -> name
+	// Build device ID → server name map
+	deviceToServer, err := c.BuildDeviceServerMap(ctx)
+	if err != nil {
+		// Non-fatal: continue without server names
+		deviceToServer = make(map[string]string)
+	}
 
-	resp, err := c.GetDevices(ctx, 1000)
+	// Fetch all devices
+	orgDevices, total, err := c.abm.FetchAllOrgDevices(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
-	total := resp.Meta.Paging.Total
-	for _, inc := range resp.Included {
-		if inc.Type == "mdmServers" && inc.Attributes.ServerName != "" {
-			serverNames[inc.ID] = inc.Attributes.ServerName
-		}
-	}
-	all = append(all, resp.Data...)
 
-	nextURL := resp.Links.Next
-	for nextURL != "" {
-		if err := ctx.Err(); err != nil {
-			return all, total, err
-		}
-		resp, err := c.GetDevicesFromURL(ctx, nextURL)
-		if err != nil {
-			return all, total, fmt.Errorf("fetching next page: %w", err)
-		}
-		for _, inc := range resp.Included {
-			if inc.Type == "mdmServers" && inc.Attributes.ServerName != "" {
-				serverNames[inc.ID] = inc.Attributes.ServerName
-			}
-		}
-		all = append(all, resp.Data...)
-		nextURL = resp.Links.Next
-	}
-
-	// Resolve server IDs to names
-	for i := range all {
-		d := &all[i]
-		if d.Relationships != nil && d.Relationships.AssignedServer != nil &&
-			d.Relationships.AssignedServer.Data != nil && d.Attributes != nil {
-			serverID := d.Relationships.AssignedServer.Data.ID
-			if name, ok := serverNames[serverID]; ok {
-				d.Attributes.AssignedServer = name
-			} else {
-				d.Attributes.AssignedServer = serverID
-			}
+	// Wrap with resolved server names
+	devices := make([]Device, len(orgDevices))
+	for i, od := range orgDevices {
+		devices[i] = Device{OrgDevice: od}
+		if name, ok := deviceToServer[od.ID]; ok {
+			devices[i].AssignedServer = name
 		}
 	}
 
-	return all, total, nil
+	return devices, total, nil
 }
 
-// GetAppleCareCoverage fetches AppleCare coverage for a device.
+// GetDevice fetches a single device by serial number and resolves its assigned MDM server name.
+func (c *Client) GetDevice(ctx context.Context, serial string) (*Device, error) {
+	resp, err := c.abm.GetOrgDevice(ctx, serial, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetching device %s: %w", serial, err)
+	}
+
+	device := &Device{OrgDevice: resp.Data}
+
+	// Resolve assigned MDM server name
+	serverResp, err := c.abm.GetOrgDeviceAssignedServer(ctx, serial, nil)
+	if err != nil {
+		log.WithError(err).WithField("serial", serial).Debug("Could not fetch assigned MDM server")
+	} else if serverResp.Data.Attributes != nil {
+		device.AssignedServer = serverResp.Data.Attributes.ServerName
+	}
+
+	return device, nil
+}
+
+// GetAppleCareCoverage fetches AppleCare coverage for a device,
+// returning a flattened struct or nil if no coverage exists.
 func (c *Client) GetAppleCareCoverage(ctx context.Context, deviceID string) (*AppleCareCoverage, error) {
-	url := fmt.Sprintf("%s/v1/orgDevices/%s/appleCareCoverage", baseURL, deviceID)
-	body, err := c.doGet(ctx, url)
+	resp, err := c.abm.GetOrgDeviceAppleCareCoverage(ctx, deviceID, nil)
 	if err != nil {
 		return nil, err
 	}
-	var resp AppleCareCoverageResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("decoding applecare response: %w", err)
-	}
 	if len(resp.Data) > 0 && resp.Data[0].Attributes != nil {
-		return resp.Data[0].Attributes, nil
+		a := resp.Data[0].Attributes
+		return &AppleCareCoverage{
+			AgreementNumber:        a.AgreementNumber,
+			ContractCancelDateTime: a.ContractCancelDateTime,
+			Description:            a.Description,
+			EndDateTime:            a.EndDateTime,
+			IsCanceled:             a.IsCanceled,
+			IsRenewable:            a.IsRenewable,
+			PaymentType:            string(a.PaymentType),
+			StartDateTime:          a.StartDateTime,
+			Status:                 string(a.Status),
+		}, nil
 	}
 	return nil, nil
-}
-
-func (c *Client) doGet(ctx context.Context, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
-	}
-
-	return body, nil
 }

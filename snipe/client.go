@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	snipeit "github.com/michellepellon/go-snipeit"
 )
@@ -19,11 +20,13 @@ var ErrDryRun = fmt.Errorf("write blocked: dry-run mode is enabled")
 
 // Client wraps the go-snipeit client and adds additional API methods.
 type Client struct {
-	Assets  *snipeit.AssetsService
-	DryRun  bool // when true, all non-GET requests are blocked
-	baseURL string
-	apiKey  string
-	http    *http.Client
+	Assets    *snipeit.AssetsService
+	Fields    *snipeit.FieldsService
+	Fieldsets *snipeit.FieldsetsService
+	DryRun    bool // when true, all non-GET requests are blocked
+	baseURL   string
+	apiKey    string
+	http      *http.Client
 }
 
 // NewClient creates a new Snipe-IT client.
@@ -36,10 +39,12 @@ func NewClient(baseURL, apiKey string) (*Client, error) {
 	}
 
 	return &Client{
-		Assets:  sc.Assets,
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		http:    &http.Client{},
+		Assets:    sc.Assets,
+		Fields:    sc.Fields,
+		Fieldsets: sc.Fieldsets,
+		baseURL:   baseURL,
+		apiKey:    apiKey,
+		http:      &http.Client{},
 	}, nil
 }
 
@@ -52,33 +57,59 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 
 	url := c.baseURL + "/" + strings.TrimLeft(path, "/")
 
-	var bodyReader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("marshaling request body: %w", err)
+	const maxRetries = 5
+
+	var resp *http.Response
+	var respBody []byte
+
+	for attempt := 0; ; attempt++ {
+		var bodyReader io.Reader
+		if body != nil {
+			data, err := json.Marshal(body)
+			if err != nil {
+				return nil, fmt.Errorf("marshaling request body: %w", err)
+			}
+			bodyReader = bytes.NewReader(data)
 		}
-		bodyReader = bytes.NewReader(data)
-	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
+		req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+		if err != nil {
+			return nil, fmt.Errorf("creating request: %w", err)
+		}
 
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err = c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("executing request: %w", err)
+		}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return resp, fmt.Errorf("reading response body: %w", err)
+		respBody, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return resp, fmt.Errorf("reading response body: %w", err)
+		}
+
+		if resp.StatusCode == 429 && attempt < maxRetries {
+			// Parse retryAfter from Snipe-IT response if available
+			wait := time.Duration(attempt+1) * 2 * time.Second
+			var retryResp struct {
+				RetryAfter int `json:"retryAfter"`
+			}
+			if json.Unmarshal(respBody, &retryResp) == nil && retryResp.RetryAfter > 0 {
+				wait = time.Duration(retryResp.RetryAfter) * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+
+		break
 	}
 
 	if resp.StatusCode >= 400 {
@@ -295,4 +326,108 @@ func (c *Client) UpdateAsset(ctx context.Context, id int, payload map[string]any
 		return nil, fmt.Errorf("updating asset %d: %w", id, err)
 	}
 	return resp, nil
+}
+
+// --- Custom fields setup ---
+
+// FieldDef defines a custom field to create in Snipe-IT.
+type FieldDef struct {
+	Name        string // display name (will be prefixed with "AXM: ")
+	Element     string // form element type: text, textarea, radio, listbox, checkbox
+	Format      string // validation format: ANY, DATE, BOOLEAN, etc.
+	HelpText    string // help text shown to users
+	FieldValues string // newline-separated list of allowed values (for radio/listbox)
+}
+
+// SetupFields creates or updates custom fields in Snipe-IT and associates them
+// with the given fieldset. If a field with the same name already exists, it is
+// updated to match the definition. Returns a map of field name -> db_column_name
+// for use in field_mapping configuration.
+func (c *Client) SetupFields(fieldsetID int, fields []FieldDef) (map[string]string, error) {
+	// Fetch all existing fields to check for duplicates
+	existing, _, err := c.Fields.List(nil)
+	if err != nil {
+		return nil, fmt.Errorf("listing existing fields: %w", err)
+	}
+	existingByName := make(map[string]snipeit.Field)
+	for _, f := range existing.Rows {
+		existingByName[f.Name] = f
+	}
+
+	results := make(map[string]string)
+
+	for _, f := range fields {
+		field := snipeit.Field{}
+		field.Name = f.Name
+		field.Element = f.Element
+		field.Format = f.Format
+		field.HelpText = f.HelpText
+		field.FieldValues = f.FieldValues
+
+		var fieldID int
+		var dbColumn string
+
+		if ex, ok := existingByName[f.Name]; ok {
+			// Field already exists — update it
+			resp, _, err := c.Fields.Update(ex.ID, field)
+			if err != nil {
+				return results, fmt.Errorf("updating field %q: %w", f.Name, err)
+			}
+			if resp.Status != "success" {
+				return results, fmt.Errorf("updating field %q: %s", f.Name, resp.Message)
+			}
+			fieldID = resp.Payload.ID
+			dbColumn = resp.Payload.DBColumnName
+			// Update response may not include db_column_name — use the one from List
+			if dbColumn == "" {
+				dbColumn = ex.DBColumnName
+			}
+		} else {
+			// Create new field
+			resp, _, err := c.Fields.Create(field)
+			if err != nil {
+				return results, fmt.Errorf("creating field %q: %w", f.Name, err)
+			}
+			if resp.Status != "success" {
+				return results, fmt.Errorf("creating field %q: %s", f.Name, resp.Message)
+			}
+			fieldID = resp.Payload.ID
+			dbColumn = resp.Payload.DBColumnName
+		}
+
+		results[f.Name] = dbColumn
+
+		if fieldsetID > 0 {
+			if _, err := c.Fields.Associate(fieldID, fieldsetID); err != nil {
+				return results, fmt.Errorf("associating field %q (ID %d) with fieldset %d: %w", f.Name, fieldID, fieldsetID, err)
+			}
+		}
+	}
+
+	// Re-fetch field list to fill in any missing db_column_name values
+	hasMissing := false
+	for _, v := range results {
+		if v == "" {
+			hasMissing = true
+			break
+		}
+	}
+	if hasMissing {
+		refreshed, _, err := c.Fields.List(nil)
+		if err == nil {
+			byName := make(map[string]string)
+			for _, f := range refreshed.Rows {
+				byName[f.Name] = f.DBColumnName
+			}
+			for name, dbCol := range results {
+				if dbCol == "" {
+					if col, ok := byName[name]; ok && col != "" {
+						results[name] = col
+					}
+				}
+			}
+		}
+	}
+
+	return results, nil
 }

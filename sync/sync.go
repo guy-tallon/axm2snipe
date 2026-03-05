@@ -6,13 +6,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/zchee/abm"
 
 	"github.com/CampusTech/axm2snipe/abmclient"
 	"github.com/CampusTech/axm2snipe/config"
+	"github.com/CampusTech/axm2snipe/notify"
 	"github.com/CampusTech/axm2snipe/snipe"
 )
 
@@ -25,12 +29,19 @@ func SetLogLevel(level logrus.Level) {
 
 // Stats tracks sync operation counts.
 type Stats struct {
-	Total     int
-	Created   int
-	Updated   int
-	Skipped   int
-	Errors    int
-	ModelNew  int
+	Total    int
+	Created  int
+	Updated  int
+	Skipped  int
+	Errors   int
+	ModelNew int
+}
+
+// ABMCache holds cached ABM device and AppleCare data.
+type ABMCache struct {
+	Timestamp time.Time                               `json:"timestamp"`
+	Devices   []abmclient.Device                      `json:"devices"`
+	AppleCare map[string]*abmclient.AppleCareCoverage `json:"applecare"` // device ID -> coverage
 }
 
 // Engine performs the sync between ABM and Snipe-IT.
@@ -38,20 +49,67 @@ type Engine struct {
 	abm       *abmclient.Client
 	snipe     *snipe.Client
 	cfg       *config.Config
+	notifier  *notify.Notifier
 	models    map[string]int // model identifier -> snipe model ID
 	suppliers map[string]int // supplier name (lowercased) -> snipe supplier ID
 	stats     Stats
+	cache     *ABMCache // populated when using --use-cache
+	saveCache string    // path to write cache to (when --save-cache is set)
 }
 
 // NewEngine creates a new sync engine.
 func NewEngine(abmClient *abmclient.Client, snipeClient *snipe.Client, cfg *config.Config) *Engine {
+	var n *notify.Notifier
+	if cfg.Slack.Enabled {
+		n = notify.NewNotifier(cfg.Slack.WebhookURL, cfg.SnipeIT.URL)
+	}
 	return &Engine{
 		abm:       abmClient,
 		snipe:     snipeClient,
 		cfg:       cfg,
+		notifier:  n,
 		models:    make(map[string]int),
 		suppliers: make(map[string]int),
 	}
+}
+
+// SetSaveCache sets the path to write ABM cache to after fetching.
+func (e *Engine) SetSaveCache(path string) {
+	e.saveCache = path
+}
+
+// LoadCache reads ABM cache from a JSON file.
+func (e *Engine) LoadCache(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading cache file: %w", err)
+	}
+	var cache ABMCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return fmt.Errorf("parsing cache file: %w", err)
+	}
+	log.Infof("Loaded cache from %s (%d devices, %d AppleCare records, cached at %s)",
+		path, len(cache.Devices), len(cache.AppleCare), cache.Timestamp.Format(time.RFC3339))
+	e.cache = &cache
+	return nil
+}
+
+// writeCache saves ABM data to a JSON cache file.
+func (e *Engine) writeCache(devices []abmclient.Device, appleCare map[string]*abmclient.AppleCareCoverage) error {
+	cache := ABMCache{
+		Timestamp: time.Now(),
+		Devices:   devices,
+		AppleCare: appleCare,
+	}
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling cache: %w", err)
+	}
+	if err := os.WriteFile(e.saveCache, data, 0644); err != nil {
+		return fmt.Errorf("writing cache file: %w", err)
+	}
+	log.Infof("Saved cache to %s (%d devices, %d AppleCare records)", e.saveCache, len(devices), len(appleCare))
+	return nil
 }
 
 // RunSingle syncs a single device identified by serial number.
@@ -66,25 +124,36 @@ func (e *Engine) RunSingle(ctx context.Context, serial string) (*Stats, error) {
 		return nil, fmt.Errorf("loading snipe suppliers: %w", err)
 	}
 
-	devices, err := e.fetchABMDevices(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("fetching ABM devices: %w", err)
-	}
-
-	var found bool
-	for _, device := range devices {
-		if strings.EqualFold(deviceSerial(device), serial) {
-			found = true
-			if err := e.processDevice(ctx, device); err != nil {
-				log.WithError(err).WithField("serial", serial).Error("Failed to process device")
-				e.stats.Errors++
+	// Check cache first, otherwise fetch single device directly from ABM
+	var device *abmclient.Device
+	if e.cache != nil {
+		for _, d := range e.cache.Devices {
+			if strings.EqualFold(deviceSerial(d), serial) {
+				device = &d
+				break
 			}
-			break
+		}
+		if device == nil {
+			return nil, fmt.Errorf("device %s not found in cache", serial)
+		}
+		// Resolve MDM server name for cached device
+		deviceToServer, err := e.abm.BuildDeviceServerMap(ctx)
+		if err != nil {
+			log.Warnf("Could not resolve MDM server names: %v", err)
+		} else if name, ok := deviceToServer[device.ID]; ok {
+			device.AssignedServer = name
+		}
+	} else {
+		var err error
+		device, err = e.abm.GetDevice(ctx, serial)
+		if err != nil {
+			return nil, fmt.Errorf("fetching device from ABM: %w", err)
 		}
 	}
 
-	if !found {
-		return nil, fmt.Errorf("device %s not found in Apple Business Manager", serial)
+	if err := e.processDevice(ctx, *device); err != nil {
+		log.WithError(err).WithField("serial", serial).Error("Failed to process device")
+		e.stats.Errors++
 	}
 
 	return &e.stats, nil
@@ -166,8 +235,36 @@ func (e *Engine) loadSuppliers(ctx context.Context) error {
 	return nil
 }
 
-// ensureSupplier checks if a supplier exists in Snipe-IT by name, creating it if needed.
-func (e *Engine) ensureSupplier(ctx context.Context, name string) (int, error) {
+// ensureSupplier resolves the supplier for an ABM device and ensures it exists in Snipe-IT.
+// It checks supplier_mapping for purchaseSourceId, then purchaseSourceType, then the
+// resolved name. Falls back to name-based lookup and auto-creation.
+func (e *Engine) ensureSupplier(ctx context.Context, attrs *abm.OrgDeviceAttributes) (int, error) {
+	purchaseSource := string(attrs.PurchaseSourceType)
+	if purchaseSource == "" && attrs.PurchaseSourceID == "" {
+		return 0, nil
+	}
+
+	// Check supplier_mapping for direct ID match (purchaseSourceId -> Snipe-IT supplier ID)
+	// then purchaseSourceType match
+	if len(e.cfg.Sync.SupplierMapping) > 0 {
+		if attrs.PurchaseSourceID != "" {
+			if id, ok := e.cfg.Sync.SupplierMapping[attrs.PurchaseSourceID]; ok {
+				return id, nil
+			}
+		}
+		for mappedKey, supplierID := range e.cfg.Sync.SupplierMapping {
+			if strings.EqualFold(mappedKey, purchaseSource) {
+				return supplierID, nil
+			}
+		}
+	}
+
+	// Resolve a human-readable supplier name from purchaseSourceType
+	name := purchaseSource
+	if strings.EqualFold(name, "APPLE") {
+		name = "Apple"
+	}
+
 	if name == "" {
 		return 0, nil
 	}
@@ -200,11 +297,34 @@ func (e *Engine) ensureSupplier(ctx context.Context, name string) (int, error) {
 	return newSupplier.ID, nil
 }
 
-// fetchABMDevices retrieves all devices from ABM, with optional product family filtering.
+// fetchABMDevices retrieves all devices from ABM (or cache), with optional product family filtering.
 func (e *Engine) fetchABMDevices(ctx context.Context) ([]abmclient.Device, error) {
-	allDevices, _, err := e.abm.GetAllDevices(ctx)
-	if err != nil {
-		return nil, err
+	var allDevices []abmclient.Device
+
+	if e.cache != nil {
+		allDevices = e.cache.Devices
+		log.Infof("Using %d cached devices", len(allDevices))
+
+		// Resolve MDM server names for cached devices (cache may not have them)
+		deviceToServer, err := e.abm.BuildDeviceServerMap(ctx)
+		if err != nil {
+			log.Warnf("Could not resolve MDM server names: %v", err)
+		} else if len(deviceToServer) > 0 {
+			resolved := 0
+			for i, d := range allDevices {
+				if name, ok := deviceToServer[d.ID]; ok {
+					allDevices[i].AssignedServer = name
+					resolved++
+				}
+			}
+			log.Infof("Resolved MDM server names for %d/%d cached devices", resolved, len(allDevices))
+		}
+	} else {
+		var err error
+		allDevices, _, err = e.abm.GetAllDevices(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Filter by product family if configured
@@ -215,12 +335,40 @@ func (e *Engine) fetchABMDevices(ctx context.Context) ([]abmclient.Device, error
 		}
 		var filtered []abmclient.Device
 		for _, d := range allDevices {
-			if d.Attributes != nil && families[strings.ToLower(d.Attributes.ProductFamily)] {
+			if d.Attributes != nil && families[strings.ToLower(string(d.Attributes.ProductFamily))] {
 				filtered = append(filtered, d)
 			}
 		}
 		log.Infof("Filtered to %d devices (from %d) by product family: %v", len(filtered), len(allDevices), e.cfg.Sync.ProductFamilies)
 		allDevices = filtered
+	}
+
+	// If saving cache, prefetch all AppleCare data and write cache
+	if e.saveCache != "" && e.cache == nil {
+		log.Info("Fetching AppleCare coverage for all devices (for cache)...")
+		appleCareMap := make(map[string]*abmclient.AppleCareCoverage)
+		for i, d := range allDevices {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			ac, err := e.abm.GetAppleCareCoverage(ctx, d.ID)
+			if err != nil {
+				log.WithError(err).WithField("device_id", d.ID).Debug("Could not fetch AppleCare coverage")
+			} else if ac != nil {
+				appleCareMap[d.ID] = ac
+			}
+			if (i+1)%50 == 0 {
+				log.Infof("AppleCare progress: %d/%d devices", i+1, len(allDevices))
+			}
+		}
+		if err := e.writeCache(allDevices, appleCareMap); err != nil {
+			log.WithError(err).Warn("Failed to write cache")
+		}
+		// Store in memory so processDevice can use it
+		e.cache = &ABMCache{
+			Devices:   allDevices,
+			AppleCare: appleCareMap,
+		}
 	}
 
 	return allDevices, nil
@@ -258,18 +406,25 @@ func (e *Engine) processDevice(ctx context.Context, device abmclient.Device) err
 		return nil
 	}
 
-	// Fetch AppleCare coverage for this device
+	// Fetch AppleCare coverage for this device (from cache or API)
 	var appleCare *abmclient.AppleCareCoverage
-	ac, err := e.abm.GetAppleCareCoverage(ctx, device.ID)
-	if err != nil {
-		logger.WithError(err).Warn("Could not fetch AppleCare coverage, continuing without it")
-	} else if ac != nil {
-		appleCare = ac
-		logger.WithField("applecare_status", appleCare.Status).Debug("Found AppleCare coverage")
+	if e.cache != nil && e.cache.AppleCare != nil {
+		if ac, ok := e.cache.AppleCare[device.ID]; ok {
+			appleCare = ac
+			logger.WithField("applecare_status", appleCare.Status).Debug("Found AppleCare coverage (cached)")
+		}
+	} else {
+		ac, err := e.abm.GetAppleCareCoverage(ctx, device.ID)
+		if err != nil {
+			logger.WithError(err).Warn("Could not fetch AppleCare coverage, continuing without it")
+		} else if ac != nil {
+			appleCare = ac
+			logger.WithField("applecare_status", appleCare.Status).Debug("Found AppleCare coverage")
+		}
 	}
 
-	// Ensure supplier exists in Snipe-IT (from ABM purchase source)
-	supplierID, err := e.ensureSupplier(ctx, attrs.PurchaseSourceType)
+	// Resolve supplier from ABM data
+	supplierID, err := e.ensureSupplier(ctx, attrs)
 	if err != nil {
 		logger.WithError(err).Warn("Could not resolve supplier, continuing without it")
 	}
@@ -281,10 +436,10 @@ func (e *Engine) processDevice(ctx context.Context, device abmclient.Device) err
 		if err != nil {
 			return fmt.Errorf("ensuring model for %s: %w", serial, err)
 		}
-		return e.createAsset(ctx, logger, attrs, modelID, supplierID, appleCare)
+		return e.createAsset(ctx, logger, device, modelID, supplierID, appleCare)
 	case 1:
 		// Update existing asset — model already assigned in Snipe-IT
-		return e.updateAsset(ctx, logger, attrs, existing.Rows[0], supplierID, appleCare)
+		return e.updateAsset(ctx, logger, device, existing.Rows[0], supplierID, appleCare)
 	default:
 		logger.Warnf("Multiple assets (%d) found for serial, skipping", existing.Total)
 		e.stats.Skipped++
@@ -293,9 +448,17 @@ func (e *Engine) processDevice(ctx context.Context, device abmclient.Device) err
 }
 
 // ensureModel checks if the device model exists in Snipe-IT, creating it if needed.
-// It tries matching by DeviceModel (marketing name like "Mac mini (2024)") and
-// PartNumber against both Snipe-IT model numbers and names.
-func (e *Engine) ensureModel(ctx context.Context, attrs *abmclient.DeviceAttributes) (int, error) {
+// It tries matching by DeviceModel (marketing name), PartNumber, and ProductType
+// (hardware identifier like "Mac16,10") against Snipe-IT model numbers and names.
+func (e *Engine) ensureModel(ctx context.Context, attrs *abm.OrgDeviceAttributes) (int, error) {
+	// Try matching ProductType (e.g. "Mac16,10") first — hardware model identifiers
+	// that may already exist in Snipe-IT as model numbers from MDM tools like Jamf
+	if attrs.ProductType != "" {
+		if id, ok := e.models[attrs.ProductType]; ok {
+			return id, nil
+		}
+	}
+
 	// Try matching DeviceModel (e.g. "Mac mini (2024)") against model numbers and names
 	if attrs.DeviceModel != "" {
 		if id, ok := e.models[attrs.DeviceModel]; ok {
@@ -310,13 +473,13 @@ func (e *Engine) ensureModel(ctx context.Context, attrs *abmclient.DeviceAttribu
 		}
 	}
 
-	if attrs.DeviceModel == "" && attrs.PartNumber == "" {
+	if attrs.DeviceModel == "" && attrs.ProductType == "" {
 		return 0, fmt.Errorf("device has no model identifier")
 	}
 
-	// Use DeviceModel as the display name, PartNumber as the model number
+	// Use DeviceModel as the display name, ProductType as the model number
 	modelName := attrs.DeviceModel
-	modelNumber := attrs.PartNumber
+	modelNumber := attrs.ProductType
 	if modelName == "" {
 		modelName = modelNumber
 	}
@@ -344,7 +507,7 @@ func (e *Engine) ensureModel(ctx context.Context, attrs *abmclient.DeviceAttribu
 	newModel, err := e.snipe.CreateModel(ctx, snipe.SnipeModel{
 		Name:           modelName,
 		ModelNumber:    modelNumber,
-		CategoryID:     e.cfg.SnipeIT.CategoryIDForFamily(attrs.ProductFamily),
+		CategoryID:     e.cfg.SnipeIT.CategoryIDForFamily(string(attrs.ProductFamily)),
 		ManufacturerID: e.cfg.SnipeIT.ManufacturerID,
 		FieldsetID:     e.cfg.SnipeIT.CustomFieldsetID,
 	})
@@ -365,7 +528,8 @@ func (e *Engine) ensureModel(ctx context.Context, attrs *abmclient.DeviceAttribu
 }
 
 // createAsset creates a new asset in Snipe-IT from ABM device data.
-func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, attrs *abmclient.DeviceAttributes, modelID int, supplierID int, appleCare *abmclient.AppleCareCoverage) error {
+func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, device abmclient.Device, modelID int, supplierID int, appleCare *abmclient.AppleCareCoverage) error {
+	attrs := device.Attributes
 	payload := map[string]any{
 		"serial":    attrs.SerialNumber,
 		"model_id":  modelID,
@@ -387,7 +551,7 @@ func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, attrs *a
 		payload["supplier_id"] = supplierID
 	}
 
-	e.applyFieldMapping(payload, attrs, appleCare)
+	e.applyFieldMapping(payload, device, appleCare)
 
 	if e.cfg.Sync.DryRun {
 		logger.WithField("payload", payload).Info("[DRY RUN] Would create asset")
@@ -408,40 +572,45 @@ func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, attrs *a
 
 	logger.Info("Created asset in Snipe-IT")
 	e.stats.Created++
+
+	// Send Slack notification for new asset
+	if e.notifier != nil {
+		e.notifier.NotifyNewAsset(ctx, device, attrs.DeviceModel, appleCare)
+	}
+
 	return nil
 }
 
 // updateAsset updates an existing Snipe-IT asset with current ABM data.
-func (e *Engine) updateAsset(ctx context.Context, logger *logrus.Entry, attrs *abmclient.DeviceAttributes, existing map[string]any, supplierID int, appleCare *abmclient.AppleCareCoverage) error {
+func (e *Engine) updateAsset(ctx context.Context, logger *logrus.Entry, device abmclient.Device, existing map[string]any, supplierID int, appleCare *abmclient.AppleCareCoverage) error {
 	snipeID, ok := existing["id"].(float64)
 	if !ok {
 		return fmt.Errorf("could not get asset ID from Snipe response")
 	}
 
-	if !e.cfg.Sync.Force && !e.cfg.Sync.DryRun {
-		abmUpdated := attrs.UpdatedDateTime
-		if snipeUpdatedRaw, ok := existing["updated_at"].(map[string]any); ok {
-			if snipeTimeStr, ok := snipeUpdatedRaw["datetime"].(string); ok {
-				snipeUpdated, err := time.Parse("2006-01-02 15:04:05", snipeTimeStr)
-				if err == nil && !abmUpdated.After(snipeUpdated) {
-					logger.Info("Skipping update, ABM data not newer than Snipe-IT")
-					e.stats.Skipped++
-					return nil
-				}
-			}
-		}
-	}
-
-	updates := make(map[string]any)
+	desired := make(map[string]any)
 	if supplierID > 0 {
-		updates["supplier_id"] = supplierID
+		desired["supplier_id"] = supplierID
 	}
-	e.applyFieldMapping(updates, attrs, appleCare)
+	e.applyFieldMapping(desired, device, appleCare)
 
-	if len(updates) == 0 {
+	if len(desired) == 0 {
 		logger.Info("No updates needed")
 		e.stats.Skipped++
 		return nil
+	}
+
+	// Unless force mode, compare desired values against current Snipe-IT values
+	// and only send fields that are missing or different.
+	updates := desired
+	if !e.cfg.Sync.Force {
+		updates = e.diffFields(desired, existing)
+		if len(updates) == 0 {
+			logger.Debug("All fields already match, skipping update")
+			e.stats.Skipped++
+			return nil
+		}
+		logger.WithField("changed_fields", len(updates)).Debug("Fields need updating")
 	}
 
 	if e.cfg.Sync.DryRun {
@@ -464,15 +633,57 @@ func (e *Engine) updateAsset(ctx context.Context, logger *logrus.Entry, attrs *a
 		"fields":   len(updates),
 		"response": resp,
 	}).Debug("Snipe-IT update response")
-	logger.WithField("fields", len(updates)).Info("Updated asset in Snipe-IT")
+	logger.Info("Updated asset in Snipe-IT")
 	e.stats.Updated++
 	return nil
+}
+
+// diffFields compares desired field values against the existing Snipe-IT asset
+// and returns only the fields that are missing or different.
+func (e *Engine) diffFields(desired map[string]any, existing map[string]any) map[string]any {
+	// Extract custom_fields from the existing asset (map of DB column -> {value, field, field_format})
+	customFields, _ := existing["custom_fields"].(map[string]any)
+
+	changed := make(map[string]any)
+	for key, desiredVal := range desired {
+		desiredStr := fmt.Sprintf("%v", desiredVal)
+
+		var currentStr string
+		if strings.HasPrefix(key, "_snipeit_") {
+			// Custom field — look up in custom_fields map
+			if customFields != nil {
+				if fieldObj, ok := customFields[key].(map[string]any); ok {
+					currentStr = fmt.Sprintf("%v", fieldObj["value"])
+				}
+			}
+		} else if strings.HasSuffix(key, "_id") {
+			// Snipe-IT returns related objects as nested maps (e.g. supplier: {id: 3, name: "CDW"}).
+			// The corresponding key without _id suffix holds the nested object.
+			relKey := strings.TrimSuffix(key, "_id")
+			if obj, ok := existing[relKey].(map[string]any); ok {
+				if id, ok := obj["id"].(float64); ok {
+					currentStr = fmt.Sprintf("%v", int(id))
+				}
+			}
+		} else {
+			// Standard field — look up at top level
+			if v, ok := existing[key]; ok && v != nil {
+				currentStr = fmt.Sprintf("%v", v)
+			}
+		}
+
+		if currentStr != desiredStr {
+			changed[key] = desiredVal
+		}
+	}
+	return changed
 }
 
 // applyFieldMapping applies user-configured field mappings from config.
 // All field mappings — ABM device attributes, AppleCare coverage, and standard
 // Snipe-IT fields like purchase_date — are driven entirely by settings.yaml.
-func (e *Engine) applyFieldMapping(payload map[string]any, attrs *abmclient.DeviceAttributes, ac *abmclient.AppleCareCoverage) {
+func (e *Engine) applyFieldMapping(payload map[string]any, device abmclient.Device, ac *abmclient.AppleCareCoverage) {
+	attrs := device.Attributes
 	for snipeField, abmField := range e.cfg.Sync.FieldMapping {
 		var value string
 		switch strings.ToLower(abmField) {
@@ -484,11 +695,13 @@ func (e *Engine) applyFieldMapping(payload map[string]any, attrs *abmclient.Devi
 		case "color":
 			value = titleCase(attrs.Color)
 		case "devicecapacity", "device_capacity":
-			value = attrs.DeviceCapacity
+			if attrs.DeviceCapacity != "" && !strings.EqualFold(attrs.DeviceCapacity, "Unknown") {
+				value = normalizeStorage(attrs.DeviceCapacity)
+			}
 		case "partnumber", "part_number":
 			value = attrs.PartNumber
 		case "productfamily", "product_family":
-			value = attrs.ProductFamily
+			value = string(attrs.ProductFamily)
 		case "producttype", "product_type":
 			value = attrs.ProductType
 		case "ordernumber", "order_number":
@@ -500,28 +713,32 @@ func (e *Engine) applyFieldMapping(payload map[string]any, attrs *abmclient.Devi
 				value = attrs.OrderDateTime.Format("2006-01-02")
 			}
 		case "purchasesource", "purchase_source":
-			value = attrs.PurchaseSourceType
+			value = string(attrs.PurchaseSourceType)
 		case "status":
-			value = attrs.Status
+			if strings.EqualFold(string(attrs.Status), "ASSIGNED") {
+				value = "true"
+			} else {
+				value = "false"
+			}
 		case "imei":
 			if len(attrs.IMEI) > 0 {
-				value = strings.Join(attrs.IMEI, ", ")
+				value = strings.Join([]string(attrs.IMEI), ", ")
 			}
 		case "meid":
 			if len(attrs.MEID) > 0 {
-				value = strings.Join(attrs.MEID, ", ")
+				value = strings.Join([]string(attrs.MEID), ", ")
 			}
 		case "wifi_mac", "wifimac":
 			if len(attrs.WifiMacAddress) > 0 {
-				value = formatMAC(strings.Join(attrs.WifiMacAddress, ", "))
+				value = formatMAC(strings.Join([]string(attrs.WifiMacAddress), ", "))
 			}
 		case "bluetooth_mac", "bluetoothmac":
 			if len(attrs.BluetoothMacAddress) > 0 {
-				value = formatMAC(strings.Join(attrs.BluetoothMacAddress, ", "))
+				value = formatMAC(strings.Join([]string(attrs.BluetoothMacAddress), ", "))
 			}
 		case "ethernet_mac", "ethernetmac":
 			if len(attrs.EthernetMacAddress) > 0 {
-				value = formatMAC(strings.Join(attrs.EthernetMacAddress, ", "))
+				value = formatMAC(strings.Join([]string(attrs.EthernetMacAddress), ", "))
 			}
 		case "eid":
 			value = attrs.EID
@@ -530,7 +747,7 @@ func (e *Engine) applyFieldMapping(payload map[string]any, attrs *abmclient.Devi
 				value = attrs.AddedToOrgDateTime.Format("2006-01-02")
 			}
 		case "assigned_server", "assignedserver", "mdm_server":
-			value = attrs.AssignedServer
+			value = device.AssignedServer
 		case "released_from_org", "releasedfromorg":
 			if !attrs.ReleasedFromOrgDateTime.IsZero() {
 				value = attrs.ReleasedFromOrgDateTime.Format("2006-01-02")
@@ -613,6 +830,23 @@ func formatMAC(s string) string {
 	}
 	return strings.ToUpper(fmt.Sprintf("%s:%s:%s:%s:%s:%s",
 		raw[0:2], raw[2:4], raw[4:6], raw[6:8], raw[8:10], raw[10:12]))
+}
+
+// normalizeStorage normalizes storage capacity to GB as a plain number.
+// e.g. "256GB" -> "256", "1TB" -> "1024", "2TB" -> "2048".
+func normalizeStorage(s string) string {
+	s = strings.TrimSpace(s)
+	upper := strings.ToUpper(s)
+	if strings.HasSuffix(upper, "TB") {
+		num := strings.TrimSpace(s[:len(s)-2])
+		if n, err := strconv.Atoi(num); err == nil {
+			return strconv.Itoa(n * 1024)
+		}
+	}
+	if strings.HasSuffix(upper, "GB") {
+		return strings.TrimSpace(s[:len(s)-2])
+	}
+	return s
 }
 
 func deviceSerial(d abmclient.Device) string {

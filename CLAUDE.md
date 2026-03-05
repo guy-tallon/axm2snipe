@@ -31,6 +31,7 @@ go build -o axm2snipe .
 - **Colors and statuses are title-cased**: ABM returns uppercase values (SILVER, ACTIVE, Paid_up_front). `titleCase()` converts underscores to spaces and title-cases (Silver, Active, Paid Up Front).
 - **CDW order numbers are cleaned**: "CDW/1CJ6QLW/002" → "1CJ6QLW" via `cleanOrderNumber()`.
 - **MAC addresses are auto-formatted**: Raw hex from ABM (e.g. "2CCA164BD29D") is converted to colon-separated format ("2C:CA:16:4B:D2:9D") via `formatMAC()`.
+- **Model matching priority**: `ensureModel()` matches against Snipe-IT models in order: ProductType (e.g. "Mac16,10") → DeviceModel (e.g. "Mac mini (2024)") → PartNumber (e.g. "MW0Y3LL/A"). ProductType is checked first because existing Snipe-IT models populated by MDM tools like Jamf use hardware identifiers as model numbers.
 - **Models indexed by name AND number**: `loadModels()` indexes Snipe-IT models by both `Name` and `ModelNumber` for flexible matching.
 - **Suppliers auto-created**: ABM's `PurchaseSourceType` is matched against existing Snipe-IT suppliers (case-insensitive).
 - **Snipe-IT validation errors detected**: Snipe-IT returns HTTP 200 with `{"status":"error"}` for validation failures. The `do()` method checks for this and returns an error.
@@ -42,7 +43,7 @@ No test files yet. Use `--dry-run -v` to verify behavior without making changes.
 
 ## Gotchas
 
-- ABM `deviceModel` returns marketing names like "Mac mini (2024)", NOT hardware identifiers like "Mac16,10" that Jamf uses.
+- ABM `deviceModel` returns marketing names like "Mac mini (2024)", NOT hardware identifiers like "Mac16,10" that Jamf uses. However, ABM `productType` does return the hardware identifier, and `ensureModel()` checks it first.
 - Snipe-IT returns HTTP 200 with `{"status":"error","messages":{...}}` for validation failures — not HTTP 4xx.
 - Snipe-IT radio/listbox fields reject values not in their predefined options — the entire update fails silently.
 - Snipe-IT MAC format fields require colon-separated MACs (e.g. "2C:CA:16:4B:D2:9D").

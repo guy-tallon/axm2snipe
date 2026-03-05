@@ -7,6 +7,7 @@ Inspired by [jamf2snipe](https://github.com/grokability/jamf2snipe), but connect
 ## Features
 
 - Syncs all devices from Apple Business Manager / Apple School Manager into Snipe-IT as hardware assets
+- Matches existing Snipe-IT models by hardware identifier (e.g. `Mac16,10`), marketing name, or part number
 - Automatically creates Snipe-IT asset models for new device types
 - Automatically creates Snipe-IT suppliers from ABM/ASM purchase sources
 - Fetches AppleCare coverage details for each device
@@ -16,6 +17,10 @@ Inspired by [jamf2snipe](https://github.com/grokability/jamf2snipe), but connect
 - Fully configurable field mapping between ABM/AppleCare attributes and Snipe-IT fields
 - Filter by product family (Mac, iPhone, iPad, AppleTV, Watch, Vision)
 - Update-only mode to sync data without creating new assets or models
+- Resolves assigned MDM server name for each device
+- Optional Slack webhook notifications when new assets are created
+- Automatic setup of Snipe-IT custom fields with `--setup-fields`
+- Automatic retry with exponential backoff for API rate limits
 - Dry-run mode with HTTP-level write protection
 - MAC address auto-formatting (raw hex to colon-separated)
 - Title-casing for colors and AppleCare values
@@ -82,6 +87,15 @@ axm2snipe --force -v
 
 # Debug logging
 axm2snipe -d
+
+# Auto-create AXM custom fields in Snipe-IT and save mappings to config
+axm2snipe --setup-fields -v
+
+# Save ABM data to cache file (avoids re-fetching on next run)
+axm2snipe --save-cache abm.cache.json -v
+
+# Use cached ABM data instead of calling Apple API
+axm2snipe --use-cache abm.cache.json -v
 ```
 
 ### CLI Flags
@@ -94,7 +108,10 @@ axm2snipe -d
 | `--dry-run` | Simulate sync without making changes |
 | `--force` | Ignore timestamps, always update |
 | `--serial` | Sync a single device by serial number (implies `--force`) |
+| `--save-cache` | Save ABM/ASM data to JSON cache file after fetching |
+| `--use-cache` | Use cached ABM/ASM data from JSON file instead of API |
 | `--connection-test` | Test API connections and exit |
+| `--setup-fields` | Create AXM custom fields in Snipe-IT and save mappings to config |
 | `--version` | Show version and exit |
 
 ### Config Options
@@ -107,7 +124,10 @@ axm2snipe -d
 | `sync.update_only` | Only update existing assets, never create new assets/models/suppliers |
 | `sync.product_families` | Filter devices by product family (`Mac`, `iPhone`, `iPad`, `Watch`, `Vision`) |
 | `sync.set_name` | Set asset name to "Model (Color)" on create |
+| `sync.supplier_mapping` | Map ABM/ASM supplier names to Snipe-IT supplier IDs |
 | `sync.field_mapping` | Map Snipe-IT fields to ABM/AppleCare source values |
+| `slack.enabled` | Enable Slack webhook notifications |
+| `slack.webhook_url` | Slack incoming webhook URL |
 
 ## How It Works
 
@@ -118,6 +138,7 @@ axm2snipe -d
    - **Looks up** the asset in Snipe-IT by serial number
    - If not found and `update_only` is true: **skips**
    - If not found: **creates** a new asset (after resolving model and supplier)
+   - **Resolves** model by matching ProductType (`Mac16,10`), then DeviceModel (`Mac mini (2024)`), then PartNumber (`MW0Y3LL/A`) against Snipe-IT model numbers and names
    - If found: **updates** the asset with mapped fields (if ABM data is newer or `--force`)
    - If multiple matches: **skips** with a warning
    - **Fetches** AppleCare coverage details from ABM/ASM
@@ -137,7 +158,7 @@ All field mappings are configured in `settings.yaml` under `sync.field_mapping`.
 | `device_capacity` | Storage capacity (e.g. "256GB") |
 | `part_number` | Apple part number (e.g. "MW0Y3LL/A") |
 | `product_family` | Product family (Mac, iPhone, iPad, etc.) |
-| `product_type` | Product type |
+| `product_type` | Hardware model identifier (e.g. "Mac16,10") — used first for model matching |
 | `order_number` | Order number (CDW-style orders auto-cleaned) |
 | `order_date` | Order date (formatted YYYY-MM-DD) |
 | `purchase_source` | Purchase source name |
@@ -218,6 +239,18 @@ To store ABM and AppleCare data in Snipe-IT custom fields:
 | AppleCare Renewable | listbox | BOOLEAN | true, false |
 | AppleCare Payment Type | radio | ANY | Paid Up Front, Free, Included, None |
 | Assigned MDM Server | text | ANY | — |
+
+## Slack Notifications
+
+axm2snipe can send a Slack notification whenever a new device is created in Snipe-IT. Messages use Slack Block Kit with device details, AppleCare status, MDM server, and a link to the asset in Snipe-IT.
+
+To enable, [create an incoming webhook](https://api.slack.com/messaging/webhooks) and add to your config:
+
+```yaml
+slack:
+  enabled: true
+  webhook_url: "https://hooks.slack.com/services/T.../B.../..."
+```
 
 ## License
 

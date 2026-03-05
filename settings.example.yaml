@@ -50,6 +50,14 @@ sync:
   # Set asset name to "Model (Color)"
   # set_name: false
 
+  # Map ABM supplier to Snipe-IT supplier ID.
+  # Keys can be purchaseSourceId (e.g. "1C71B60") or purchaseSourceType (e.g. "APPLE", "MANUALLY_ADDED").
+  # Checked before name-based lookup and auto-creation.
+  # supplier_mapping:
+  #   "1C71B60": 3   # CDW-G (by purchaseSourceId)
+  #   APPLE: 1       # Apple (by purchaseSourceType)
+  #   MANUALLY_ADDED: 2
+
   # Custom field mappings: Snipe-IT field name -> ABM attribute
   # Left side: Snipe-IT DB column name (e.g. _snipeit_fieldname_1)
   #            or standard Snipe-IT field (purchase_date, order_number)
@@ -92,3 +100,10 @@ sync:
   #   _snipeit_applecare_renewable_12: applecare_renewable
   #   _snipeit_applecare_payment_type_13: applecare_payment_type
   #   _snipeit_assigned_mdm_server_14: assigned_server
+
+# Optional Slack webhook notifications
+# Sends a message when a new device is created in Snipe-IT
+# Create a webhook at https://api.slack.com/messaging/webhooks
+# slack:
+#   enabled: true
+#   webhook_url: "your-slack-webhook-url"

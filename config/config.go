@@ -12,6 +12,13 @@ type Config struct {
 	ABM    ABMConfig    `yaml:"abm"`
 	SnipeIT SnipeITConfig `yaml:"snipe_it"`
 	Sync   SyncConfig   `yaml:"sync"`
+	Slack  SlackConfig  `yaml:"slack"`
+}
+
+// SlackConfig holds optional Slack webhook notification settings.
+type SlackConfig struct {
+	WebhookURL string `yaml:"webhook_url"` // Slack incoming webhook URL
+	Enabled    bool   `yaml:"enabled"`     // whether to send notifications
 }
 
 // ABMConfig holds Apple Business/School Manager settings.
@@ -42,6 +49,7 @@ type SyncConfig struct {
 	ProductFamilies  []string          `yaml:"product_families"`  // filter by product family (Mac, iPhone, iPad, etc.)
 	SetName          bool              `yaml:"set_name"`          // set asset name on create (default false)
 	FieldMapping     map[string]string `yaml:"field_mapping"`     // snipe field -> ABM attribute mapping
+	SupplierMapping  map[string]int    `yaml:"supplier_mapping"`  // ABM purchaseSourceId or purchaseSourceType -> snipe supplier ID
 }
 
 // Load reads configuration from a YAML file and applies environment variable overrides.
@@ -107,6 +115,87 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("snipe_it.category_id (or computer_category_id/mobile_category_id) is required")
 	}
 	return nil
+}
+
+// MergeFieldMapping reads a YAML config file, merges new field mappings into
+// sync.field_mapping (without overwriting existing entries), and writes it back.
+// Comments and structure are preserved via yaml.v3 node API.
+func MergeFieldMapping(path string, newMappings map[string]string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading config file: %w", err)
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("parsing config file: %w", err)
+	}
+
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return fmt.Errorf("unexpected YAML structure")
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("expected mapping at root")
+	}
+
+	// Find or create "sync" mapping
+	syncNode := findOrCreateMapping(root, "sync")
+
+	// Find or create "field_mapping" mapping under sync
+	fmNode := findOrCreateMapping(syncNode, "field_mapping")
+
+	// Build set of existing keys
+	existing := make(map[string]bool)
+	for i := 0; i < len(fmNode.Content)-1; i += 2 {
+		existing[fmNode.Content[i].Value] = true
+	}
+
+	// Add new mappings (skip if key already exists or is empty)
+	for dbCol, abmAttr := range newMappings {
+		if dbCol == "" || abmAttr == "" || existing[dbCol] {
+			continue
+		}
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: dbCol, Tag: "!!str"}
+		valNode := &yaml.Node{Kind: yaml.ScalarNode, Value: abmAttr, Tag: "!!str"}
+		fmNode.Content = append(fmNode.Content, keyNode, valNode)
+	}
+
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	if err := os.WriteFile(path, out, 0644); err != nil {
+		return fmt.Errorf("writing config file: %w", err)
+	}
+
+	return nil
+}
+
+// findOrCreateMapping finds a key in a mapping node and returns its value node.
+// If the key doesn't exist, it creates a new mapping entry. If the value node
+// is null/scalar (e.g. "field_mapping:" with no value), it is converted to a
+// mapping node in place.
+func findOrCreateMapping(parent *yaml.Node, key string) *yaml.Node {
+	for i := 0; i < len(parent.Content)-1; i += 2 {
+		if parent.Content[i].Value == key {
+			valNode := parent.Content[i+1]
+			// Handle null/empty value — convert to mapping in place
+			if valNode.Kind != yaml.MappingNode {
+				valNode.Kind = yaml.MappingNode
+				valNode.Tag = "!!map"
+				valNode.Value = ""
+				valNode.Content = nil
+			}
+			return valNode
+		}
+	}
+	// Create new mapping
+	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"}
+	valNode := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	parent.Content = append(parent.Content, keyNode, valNode)
+	return valNode
 }
 
 // CategoryIDForFamily returns the appropriate Snipe-IT category ID for a given
