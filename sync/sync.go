@@ -265,7 +265,7 @@ func (e *Engine) ensureSupplier(ctx context.Context, attrs *abm.OrgDeviceAttribu
 		name = "Apple"
 	}
 
-	if name == "" {
+	if name == "" || strings.EqualFold(name, "MANUALLY_ADDED") {
 		return 0, nil
 	}
 
