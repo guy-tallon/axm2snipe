@@ -12,14 +12,14 @@ Inspired by [jamf2snipe](https://github.com/grokability/jamf2snipe), but connect
 - Automatically creates Snipe-IT suppliers from ABM/ASM purchase sources
 - Fetches AppleCare coverage details for each device
 - Matches existing assets by serial number (create or update)
-- Sync a single device by serial number with `--serial`
+- Sync a single device by serial number with `sync --serial`
 - Timestamp-based change detection to skip unchanged records
 - Fully configurable field mapping between ABM/AppleCare attributes and Snipe-IT fields
 - Filter by product family (Mac, iPhone, iPad, AppleTV, Watch, Vision)
 - Update-only mode to sync data without creating new assets or models
 - Resolves assigned MDM server name for each device
 - Optional Slack webhook notifications when new assets are created
-- Automatic setup of Snipe-IT custom fields with `--setup-fields`
+- Automatic setup of Snipe-IT custom fields with `setup` command
 - Automatic retry with exponential backoff for API rate limits
 - Dry-run mode with HTTP-level write protection
 - MAC address auto-formatting (raw hex to colon-separated)
@@ -70,49 +70,70 @@ See [settings.example.yaml](settings.example.yaml) for all options and documenta
 ## Usage
 
 ```bash
-# Test connections
-axm2snipe --connection-test
+# Test connections to ABM and Snipe-IT
+axm2snipe test
 
-# Dry run (no changes made — writes blocked at HTTP level)
-axm2snipe --dry-run -v
+# Download ABM data to local cache
+axm2snipe download -v
+
+# Dry run sync (no changes made - writes blocked at HTTP level)
+axm2snipe sync --dry-run -v
 
 # Full sync
-axm2snipe -v
+axm2snipe sync -v
+
+# Sync from cached data (avoids ABM API calls)
+axm2snipe sync --use-cache -v
 
 # Sync a single device by serial number
-axm2snipe --serial ABCD1234XYZ -v
+axm2snipe sync --serial ABCD1234XYZ -v
 
 # Force update all assets (ignore timestamps)
-axm2snipe --force -v
-
-# Debug logging
-axm2snipe -d
+axm2snipe sync --force -v
 
 # Auto-create AXM custom fields in Snipe-IT and save mappings to config
-axm2snipe --setup-fields -v
+axm2snipe setup -v
 
-# Save ABM data to cache file (avoids re-fetching on next run)
-axm2snipe --save-cache abm.cache.json -v
+# Debug logging
+axm2snipe sync -d
 
-# Use cached ABM data instead of calling Apple API
-axm2snipe --use-cache abm.cache.json -v
+# Print an ABM access token (useful for manual API testing with curl)
+axm2snipe access-token
+
+# Make an authenticated ABM API request
+axm2snipe request https://mdmenrollment.apple.com/server/devices
 ```
 
-### CLI Flags
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `sync` | Sync ABM/ASM devices into Snipe-IT |
+| `download` | Download ABM/ASM data to local cache |
+| `setup` | Create AXM custom fields in Snipe-IT and save mappings to config |
+| `test` | Test connections to ABM/ASM and Snipe-IT |
+| `access-token` | Print an ABM API access token |
+| `request <url>` | Make an authenticated ABM API GET request |
+
+### Global Flags
 
 | Flag | Description |
 | --- | --- |
-| `-config` | Path to config file (default: `settings.yaml`) |
-| `-v` | Verbose output (INFO level) |
-| `-d` | Debug output (DEBUG level) |
+| `--config` | Path to config file (default: `settings.yaml`) |
+| `-v, --verbose` | Verbose output (INFO level) |
+| `-d, --debug` | Debug output (DEBUG level) |
+| `--version` | Show version and exit |
+
+### Sync Flags
+
+| Flag | Description |
+| --- | --- |
 | `--dry-run` | Simulate sync without making changes |
 | `--force` | Ignore timestamps, always update |
 | `--serial` | Sync a single device by serial number (implies `--force`) |
-| `--save-cache` | Save ABM/ASM data to JSON cache file after fetching |
-| `--use-cache` | Use cached ABM/ASM data from JSON file instead of API |
-| `--connection-test` | Test API connections and exit |
-| `--setup-fields` | Create AXM custom fields in Snipe-IT and save mappings to config |
-| `--version` | Show version and exit |
+| `--use-cache` | Use cached data instead of fetching from ABM API |
+| `--update-only` | Only update existing assets, never create new ones |
+| `--cache-dir` | Directory for cached API responses (default: `.cache`) |
 
 ### Config Options
 
@@ -154,19 +175,19 @@ All field mappings are configured in `settings.yaml` under `sync.field_mapping`.
 | --- | --- |
 | `serial_number` | Device serial number |
 | `device_model` | Marketing name (e.g. "Mac mini (2024)") |
-| `color` | Device color (auto title-cased: SILVER → Silver) |
+| `color` | Device color (auto title-cased: SILVER -> Silver) |
 | `device_capacity` | Storage capacity (e.g. "256GB") |
 | `part_number` | Apple part number (e.g. "MW0Y3LL/A") |
 | `product_family` | Product family (Mac, iPhone, iPad, etc.) |
-| `product_type` | Hardware model identifier (e.g. "Mac16,10") — used first for model matching |
+| `product_type` | Hardware model identifier (e.g. "Mac16,10") -- used first for model matching |
 | `order_number` | Order number (CDW-style orders auto-cleaned) |
 | `order_date` | Order date (formatted YYYY-MM-DD) |
 | `purchase_source` | Purchase source name |
 | `status` | ABM device status |
 | `imei` | IMEI number(s) |
 | `meid` | MEID number(s) |
-| `wifi_mac` | Wi-Fi MAC address(es), auto-formatted with colons |
-| `bluetooth_mac` | Bluetooth MAC address(es), auto-formatted with colons |
+| `wifi_mac` | Wi-Fi MAC address, auto-formatted with colons |
+| `bluetooth_mac` | Bluetooth MAC address, auto-formatted with colons |
 | `ethernet_mac` | Ethernet MAC address(es), auto-formatted with colons |
 | `eid` | eSIM EID |
 | `added_to_org` | Date added to organization |
@@ -198,13 +219,13 @@ Example field mapping:
 ```yaml
 sync:
   field_mapping:
-    # ABM device attributes → Snipe-IT custom fields
+    # ABM device attributes -> Snipe-IT custom fields
     _snipeit_mac_address_1: wifi_mac
     _snipeit_storage_3: device_capacity
     _snipeit_color_7: color
     purchase_date: order_date
     order_number: order_number
-    # AppleCare coverage → Snipe-IT custom fields
+    # AppleCare coverage -> Snipe-IT custom fields
     _snipeit_warranty_end_date_4: applecare_end
     _snipeit_warranty_id_5: applecare_agreement
     _snipeit_applecare_status_9: applecare_status
@@ -217,9 +238,20 @@ sync:
 
 ## Snipe-IT Custom Fields Setup
 
-To store ABM and AppleCare data in Snipe-IT custom fields:
+Use the `setup` command to automatically create custom fields in Snipe-IT:
 
-1. Create custom fields under **Admin > Custom Fields** (or use the included [`create_fields.sh`](create_fields.sh) script)
+```bash
+axm2snipe setup -v
+```
+
+This will:
+1. Create AXM custom fields in Snipe-IT
+2. Associate them with your configured fieldset (`snipe_it.custom_fieldset_id`)
+3. Save the resulting field mappings to your config file
+
+Alternatively, create them manually:
+
+1. Create custom fields under **Admin > Custom Fields**
 2. Note the **DB column name** for each field (e.g. `_snipeit_applecare_status_9`)
 3. Create a **Custom Fieldset** grouping these fields
 4. Assign the fieldset to your asset models
@@ -230,15 +262,15 @@ To store ABM and AppleCare data in Snipe-IT custom fields:
 
 | Field | Element | Format | Values |
 | --- | --- | --- | --- |
-| MAC Address | text | MAC | — |
-| Color | text | ANY | — |
-| Storage | text | ANY | — |
-| Warranty End Date | text | DATE | — |
+| MAC Address | text | MAC | -- |
+| Color | text | ANY | -- |
+| Storage | text | ANY | -- |
+| Warranty End Date | text | DATE | -- |
 | AppleCare Status | radio | ANY | Active, Inactive, Expired |
-| AppleCare Start Date | text | DATE | — |
+| AppleCare Start Date | text | DATE | -- |
 | AppleCare Renewable | listbox | BOOLEAN | true, false |
 | AppleCare Payment Type | radio | ANY | Paid Up Front, Free, Included, None |
-| Assigned MDM Server | text | ANY | — |
+| Assigned MDM Server | text | ANY | -- |
 
 ## Slack Notifications
 
