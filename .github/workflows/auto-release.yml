@@ -48,63 +48,7 @@ jobs:
           fi
 
           # Ask Claude to determine bump type from PR contents
-          BUMP=$(python3 - "$PREV_TAG" <<'PYEOF'
-          import sys, os, json, urllib.request, subprocess
-
-          prev_tag = sys.argv[1]
-          since = os.environ["SINCE"]
-          repo = os.environ["REPO"]
-
-          prs_json = subprocess.run(
-              ["gh", "pr", "list", "--repo", repo,
-               "--state", "merged",
-               "--search", f"merged:>={since}",
-               "--json", "number,title,body",
-               "--limit", "100"],
-              capture_output=True, text=True
-          ).stdout
-          prs = json.loads(prs_json) if prs_json.strip() else []
-
-          pr_text = "\n\n".join(
-              f"PR #{pr['number']}: {pr['title']}\n{(pr['body'] or '').strip()}"
-              for pr in prs
-          )
-
-          prompt = f"""You are a semantic versioning expert. Given the following merged pull requests for a Go CLI tool (axm2snipe), determine the appropriate semver bump type.
-
-          Current version: {prev_tag}
-
-          Merged pull requests:
-          {pr_text}
-
-          Semver rules:
-          - MAJOR: breaking changes, removed features, incompatible config/API changes
-          - MINOR: new features, new commands, new config options (backwards compatible)
-          - PATCH: bug fixes, performance improvements, docs, tests, refactoring (no new features)
-
-          Respond with exactly one word: MAJOR, MINOR, or PATCH."""
-
-          payload = {
-              "model": "claude-haiku-4-5-20251001",
-              "max_tokens": 10,
-              "messages": [{"role": "user", "content": prompt}]
-          }
-
-          req = urllib.request.Request(
-              "https://api.anthropic.com/v1/messages",
-              data=json.dumps(payload).encode(),
-              headers={
-                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                  "anthropic-version": "2023-06-01",
-                  "content-type": "application/json",
-              },
-              method="POST"
-          )
-          with urllib.request.urlopen(req) as resp:
-              data = json.loads(resp.read())
-          print(data["content"][0]["text"].strip().upper())
-          PYEOF
-          )
+          BUMP=$(python3 .github/scripts/determine_bump.py "$PREV_TAG")
 
           # Validate bump type
           if [ "$BUMP" != "MAJOR" ] && [ "$BUMP" != "MINOR" ] && [ "$BUMP" != "PATCH" ]; then
