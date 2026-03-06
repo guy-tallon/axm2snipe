@@ -300,18 +300,22 @@ func TestApplyFieldMapping(t *testing.T) {
 		AssignedServer: "TestMDM",
 	}
 
-	ac := &abmclient.AppleCareCoverage{
+	acRecord := abmclient.AppleCareCoverage{
 		Status:        "ACTIVE",
 		StartDateTime: acStart,
 		EndDateTime:   acEnd,
 		PaymentType:   "Paid_up_front",
 		IsRenewable:   true,
 	}
+	coverage := &abmclient.CoverageResult{
+		Best: &acRecord,
+		All:  []abmclient.AppleCareCoverage{acRecord},
+	}
 
 	asset := snipeit.Asset{
 		CommonFields: snipeit.CommonFields{CustomFields: make(map[string]string)},
 	}
-	e.applyFieldMapping(&asset, device, ac)
+	e.applyFieldMapping(&asset, device, coverage)
 
 	checks := map[string]string{
 		"_snipeit_color_1":   "Space Gray",
@@ -702,10 +706,11 @@ func TestCacheRoundTrip(t *testing.T) {
 		makeDevice("D2", "SN002", "Mac", "Mac14,7"),
 	}
 
-	appleCare := map[string]*abmclient.AppleCareCoverage{
+	acRecord := abmclient.AppleCareCoverage{Status: "ACTIVE", Description: "AppleCare+ for Mac"}
+	appleCare := map[string]*abmclient.CoverageResult{
 		"D1": {
-			Status:      "ACTIVE",
-			Description: "AppleCare+ for Mac",
+			Best: &acRecord,
+			All:  []abmclient.AppleCareCoverage{acRecord},
 		},
 	}
 
@@ -732,8 +737,8 @@ func TestCacheRoundTrip(t *testing.T) {
 	if e.cache.Devices[0].Attributes.SerialNumber != "SN001" {
 		t.Errorf("device serial = %q, want SN001", e.cache.Devices[0].Attributes.SerialNumber)
 	}
-	if e.cache.AppleCare["D1"].Status != "ACTIVE" {
-		t.Errorf("AppleCare status = %q, want ACTIVE", e.cache.AppleCare["D1"].Status)
+	if e.cache.AppleCare["D1"].Best.Status != "ACTIVE" {
+		t.Errorf("AppleCare status = %q, want ACTIVE", e.cache.AppleCare["D1"].Best.Status)
 	}
 }
 
