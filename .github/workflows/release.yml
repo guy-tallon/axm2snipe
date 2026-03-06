@@ -47,7 +47,7 @@ jobs:
           fi
 
           export SINCE
-          python3 - "$VERSION" "$PREV_TAG" <<PYEOF > release_notes.md
+          python3 - "$VERSION" "$PREV_TAG" <<'PYEOF' > release_notes.md
           import sys, os, json, urllib.request, subprocess
 
           version = sys.argv[1]
