@@ -183,6 +183,7 @@ const appleCareWorkers = 10
 func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient.Device) map[string]*abmclient.CoverageResult {
 	type result struct {
 		deviceID string
+		serial   string
 		coverage *abmclient.CoverageResult
 		err      error
 	}
@@ -202,12 +203,13 @@ func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient
 	for range workers {
 		go func() {
 			for d := range jobs {
+				serial := deviceSerial(d)
 				if ctx.Err() != nil {
-					results <- result{deviceID: d.ID}
+					results <- result{deviceID: d.ID, serial: serial}
 					continue
 				}
 				ac, err := e.abm.GetAppleCareCoverage(ctx, d.ID)
-				results <- result{deviceID: d.ID, coverage: ac, err: err}
+				results <- result{deviceID: d.ID, serial: serial, coverage: ac, err: err}
 			}
 		}()
 	}
@@ -236,6 +238,7 @@ func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient
 			appleCareMap[r.deviceID] = r.coverage
 		}
 		if bar != nil {
+			bar.Describe(fmt.Sprintf("  AppleCare for %-14s", r.serial))
 			_ = bar.Add(1)
 		} else if (i+1)%50 == 0 {
 			log.Infof("AppleCare progress: %d/%d devices", i+1, n)
