@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/schollz/progressbar/v3"
 	snipeit "github.com/michellepellon/go-snipeit"
 	"github.com/sirupsen/logrus"
 	"github.com/zchee/abm"
@@ -46,14 +47,15 @@ type ABMCache struct {
 
 // Engine performs the sync between ABM and Snipe-IT.
 type Engine struct {
-	abm       *abmclient.Client
-	snipe     *snipe.Client
-	cfg       *config.Config
-	notifier  *notify.Notifier
-	models    map[string]int // model identifier -> snipe model ID
-	suppliers map[string]int // supplier name (lowercased) -> snipe supplier ID
-	stats     Stats
-	cache     *ABMCache // populated when using --use-cache
+	abm          *abmclient.Client
+	snipe        *snipe.Client
+	cfg          *config.Config
+	notifier     *notify.Notifier
+	models       map[string]int // model identifier -> snipe model ID
+	suppliers    map[string]int // supplier name (lowercased) -> snipe supplier ID
+	stats        Stats
+	cache        *ABMCache // populated when using --use-cache
+	ShowProgress bool      // show progress bars during download
 }
 
 // NewEngine creates a new sync engine.
@@ -216,6 +218,16 @@ func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient
 	close(jobs)
 
 	appleCareMap := make(map[string]*abmclient.AppleCareCoverage)
+	var bar *progressbar.ProgressBar
+	if e.ShowProgress {
+		bar = progressbar.NewOptions(n,
+			progressbar.OptionSetDescription("  AppleCare"),
+			progressbar.OptionSetWriter(os.Stderr),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSetWidth(40),
+			progressbar.OptionOnCompletion(func() { fmt.Fprintln(os.Stderr) }),
+		)
+	}
 	for i := range n {
 		r := <-results
 		if r.err != nil {
@@ -223,9 +235,14 @@ func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient
 		} else if r.coverage != nil {
 			appleCareMap[r.deviceID] = r.coverage
 		}
-		if (i+1)%50 == 0 {
+		if bar != nil {
+			_ = bar.Add(1)
+		} else if (i+1)%50 == 0 {
 			log.Infof("AppleCare progress: %d/%d devices", i+1, n)
 		}
+	}
+	if bar != nil {
+		_ = bar.Finish()
 	}
 
 	if ctx.Err() != nil && len(appleCareMap) > 0 {
