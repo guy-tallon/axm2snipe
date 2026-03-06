@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -108,7 +109,14 @@ func (c *Config) ValidateABM() error {
 		return fmt.Errorf("abm.key_id is required")
 	}
 	if c.ABM.PrivateKey == "" {
-		return fmt.Errorf("abm.private_key is required")
+		return fmt.Errorf("abm.private_key is required (file path or inline PEM)")
+	}
+	// If the value doesn't look like PEM content, treat it as a file path and
+	// verify it exists so the user gets a clear error instead of a parse failure.
+	if !strings.HasPrefix(strings.TrimSpace(c.ABM.PrivateKey), "-----BEGIN") {
+		if _, err := os.Stat(c.ABM.PrivateKey); err != nil {
+			return fmt.Errorf("abm.private_key file not found: %s", c.ABM.PrivateKey)
+		}
 	}
 	return nil
 }

@@ -6,8 +6,15 @@ abm:
   # Generate these at https://business.apple.com or https://school.apple.com (Settings > API)
   client_id: "BUSINESSAPI.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
   key_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-  # Path to the private key PEM file downloaded from ABM
+  # Path to the private key PEM file downloaded from ABM, OR an inline PEM string.
+  # File path (recommended for local use):
   private_key: "./axm2snipe.pem"
+  # Inline PEM (useful for containers/CI where mounting a file is inconvenient):
+  # private_key: |
+  #   -----BEGIN EC PRIVATE KEY-----
+  #   MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg...
+  #   -----END EC PRIVATE KEY-----
+  # The AXM_ABM_PRIVATE_KEY environment variable also accepts inline PEM.
 
 snipe_it:
   # Snipe-IT instance URL (no trailing slash)
