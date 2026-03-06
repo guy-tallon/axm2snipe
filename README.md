@@ -47,6 +47,8 @@ Inspired by [jamf2snipe](https://github.com/grokability/jamf2snipe), but connect
 
 ```bash
 go install github.com/CampusTech/axm2snipe@latest
+export PATH="$PATH:$HOME/go/bin"
+source ~/.zshrc
 ```
 
 Or build from source:
@@ -55,6 +57,9 @@ Or build from source:
 git clone https://github.com/CampusTech/axm2snipe.git
 cd axm2snipe
 go build -o axm2snipe .
+mv axm2snipe ~/go/bin/
+export PATH="$PATH:$HOME/go/bin"
+source ~/.zshrc
 ```
 
 ## Configuration
