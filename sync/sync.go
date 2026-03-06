@@ -42,7 +42,7 @@ type Stats struct {
 // ABMCache holds cached ABM device and AppleCare data loaded from the cache directory.
 type ABMCache struct {
 	Devices   []abmclient.Device
-	AppleCare map[string]*abmclient.AppleCareCoverage // device ID -> coverage
+	AppleCare map[string]*abmclient.CoverageResult // device ID -> coverage
 }
 
 // Engine performs the sync between ABM and Snipe-IT.
@@ -157,7 +157,7 @@ func (e *Engine) LoadCache() error {
 		return fmt.Errorf("parsing %s: %w", devicesPath, err)
 	}
 
-	appleCareMap := make(map[string]*abmclient.AppleCareCoverage)
+	appleCareMap := make(map[string]*abmclient.CoverageResult)
 	acPath := filepath.Join(cacheDir, "applecare.json")
 	acData, err := os.ReadFile(acPath)
 	if err != nil {
@@ -180,16 +180,16 @@ const appleCareWorkers = 10
 // fetchAppleCareParallel fetches AppleCare coverage for all devices concurrently
 // using a bounded worker pool. Returns a map of device ID → coverage.
 // Saves partial results to disk if the context is cancelled mid-way.
-func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient.Device) map[string]*abmclient.AppleCareCoverage {
+func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient.Device) map[string]*abmclient.CoverageResult {
 	type result struct {
 		deviceID string
-		coverage *abmclient.AppleCareCoverage
+		coverage *abmclient.CoverageResult
 		err      error
 	}
 
 	n := len(devices)
 	if n == 0 {
-		return make(map[string]*abmclient.AppleCareCoverage)
+		return make(map[string]*abmclient.CoverageResult)
 	}
 
 	jobs := make(chan abmclient.Device, n)
@@ -217,7 +217,7 @@ func (e *Engine) fetchAppleCareParallel(ctx context.Context, devices []abmclient
 	}
 	close(jobs)
 
-	appleCareMap := make(map[string]*abmclient.AppleCareCoverage)
+	appleCareMap := make(map[string]*abmclient.CoverageResult)
 	var bar *progressbar.ProgressBar
 	if e.ShowProgress {
 		bar = progressbar.NewOptions(n,
@@ -553,19 +553,23 @@ func (e *Engine) processDevice(ctx context.Context, device abmclient.Device) err
 	}
 
 	// Fetch AppleCare coverage for this device (from cache or API)
-	var appleCare *abmclient.AppleCareCoverage
+	var coverage *abmclient.CoverageResult
 	if e.cache != nil && e.cache.AppleCare != nil {
 		if ac, ok := e.cache.AppleCare[device.ID]; ok {
-			appleCare = ac
-			logger.WithField("applecare_status", appleCare.Status).Debug("Found AppleCare coverage (cached)")
+			coverage = ac
+			if ac.Best != nil {
+				logger.WithField("applecare_status", ac.Best.Status).Debug("Found AppleCare coverage (cached)")
+			}
 		}
 	} else {
 		ac, err := e.abm.GetAppleCareCoverage(ctx, device.ID)
 		if err != nil {
 			logger.WithError(err).Warn("Could not fetch AppleCare coverage, continuing without it")
 		} else if ac != nil {
-			appleCare = ac
-			logger.WithField("applecare_status", appleCare.Status).Debug("Found AppleCare coverage")
+			coverage = ac
+			if ac.Best != nil {
+				logger.WithField("applecare_status", ac.Best.Status).Debug("Found AppleCare coverage")
+			}
 		}
 	}
 
@@ -582,10 +586,10 @@ func (e *Engine) processDevice(ctx context.Context, device abmclient.Device) err
 		if err != nil {
 			return fmt.Errorf("ensuring model for %s: %w", serial, err)
 		}
-		return e.createAsset(ctx, logger, device, modelID, supplierID, appleCare)
+		return e.createAsset(ctx, logger, device, modelID, supplierID, coverage)
 	case 1:
 		// Update existing asset — model already assigned in Snipe-IT
-		return e.updateAsset(ctx, logger, device, &existing.Rows[0], supplierID, appleCare)
+		return e.updateAsset(ctx, logger, device, &existing.Rows[0], supplierID, coverage)
 	default:
 		logger.Warnf("Multiple assets (%d) found for serial, skipping", existing.Total)
 		e.stats.Skipped++
@@ -678,7 +682,7 @@ func (e *Engine) ensureModel(ctx context.Context, attrs *abm.OrgDeviceAttributes
 }
 
 // createAsset creates a new asset in Snipe-IT from ABM device data.
-func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, device abmclient.Device, modelID int, supplierID int, appleCare *abmclient.AppleCareCoverage) error {
+func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, device abmclient.Device, modelID int, supplierID int, coverage *abmclient.CoverageResult) error {
 	attrs := device.Attributes
 
 	asset := snipeit.Asset{
@@ -711,7 +715,8 @@ func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, device a
 		}
 	}
 
-	e.applyFieldMapping(&asset, device, appleCare)
+	e.applyFieldMapping(&asset, device, coverage)
+	applyWarrantyNotes(&asset, coverage)
 
 	if e.cfg.Sync.DryRun {
 		logger.WithField("payload", asset).Info("[DRY RUN] Would create asset")
@@ -728,14 +733,18 @@ func (e *Engine) createAsset(ctx context.Context, logger *logrus.Entry, device a
 
 	// Send Slack notification for new asset
 	if e.notifier != nil {
-		e.notifier.NotifyNewAsset(ctx, device, attrs.DeviceModel, appleCare)
+		var best *abmclient.AppleCareCoverage
+		if coverage != nil {
+			best = coverage.Best
+		}
+		e.notifier.NotifyNewAsset(ctx, device, attrs.DeviceModel, best)
 	}
 
 	return nil
 }
 
 // updateAsset updates an existing Snipe-IT asset with current ABM data.
-func (e *Engine) updateAsset(ctx context.Context, logger *logrus.Entry, device abmclient.Device, existing *snipeit.Asset, supplierID int, appleCare *abmclient.AppleCareCoverage) error {
+func (e *Engine) updateAsset(ctx context.Context, logger *logrus.Entry, device abmclient.Device, existing *snipeit.Asset, supplierID int, coverage *abmclient.CoverageResult) error {
 	desired := snipeit.Asset{
 		CommonFields: snipeit.CommonFields{
 			CustomFields: make(map[string]string),
@@ -748,7 +757,8 @@ func (e *Engine) updateAsset(ctx context.Context, logger *logrus.Entry, device a
 		}
 	}
 
-	e.applyFieldMapping(&desired, device, appleCare)
+	e.applyFieldMapping(&desired, device, coverage)
+	applyWarrantyNotes(&desired, coverage)
 
 	// Unless force mode, compare desired values against current Snipe-IT values
 	// and only send fields that are missing or different.
@@ -804,6 +814,12 @@ func (e *Engine) diffAsset(desired *snipeit.Asset, existing *snipeit.Asset) *sni
 		hasChanges = true
 	}
 
+	// Compare notes (only the sentinel block portion)
+	if desired.Notes != "" && desired.Notes != existing.Notes {
+		diff.Notes = desired.Notes
+		hasChanges = true
+	}
+
 	// Compare custom fields
 	for key, desiredVal := range desired.CustomFields {
 		currentVal := existing.CustomFields[key]
@@ -825,7 +841,11 @@ func (e *Engine) diffAsset(desired *snipeit.Asset, existing *snipeit.Asset) *sni
 // Custom field keys (starting with _snipeit_) go into Asset.CustomFields;
 // all other mapped values also go into CustomFields since Snipe-IT treats
 // them as top-level keys on write.
-func (e *Engine) applyFieldMapping(asset *snipeit.Asset, device abmclient.Device, ac *abmclient.AppleCareCoverage) {
+func (e *Engine) applyFieldMapping(asset *snipeit.Asset, device abmclient.Device, coverage *abmclient.CoverageResult) {
+	var ac *abmclient.AppleCareCoverage
+	if coverage != nil {
+		ac = coverage.Best
+	}
 	attrs := device.Attributes
 	for snipeField, abmField := range e.cfg.Sync.FieldMapping {
 		var value string
@@ -937,6 +957,55 @@ func (e *Engine) applyFieldMapping(asset *snipeit.Asset, device abmclient.Device
 		months := int(ac.EndDateTime.Sub(attrs.OrderDateTime).Hours() / (24 * 30))
 		if months > 0 {
 			asset.WarrantyMonths = snipeit.FlexInt(months)
+		}
+	}
+}
+
+const (
+	warrantyNotesStart = "<!-- axm2snipe:warranty-start -->"
+	warrantyNotesEnd   = "<!-- axm2snipe:warranty-end -->"
+)
+
+// applyWarrantyNotes writes all AppleCare coverage records into a sentinel-delimited
+// block in asset.Notes, preserving any existing notes outside the block.
+func applyWarrantyNotes(asset *snipeit.Asset, coverage *abmclient.CoverageResult) {
+	if coverage == nil || len(coverage.All) == 0 {
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(warrantyNotesStart + "\n")
+	for _, c := range coverage.All {
+		status := titleCase(c.Status)
+		start := c.StartDateTime.Format("2006-01-02")
+		end := c.EndDateTime.Format("2006-01-02")
+		line := fmt.Sprintf("[%s] %-20s %s to %s", status, c.Description, start, end)
+		if c.AgreementNumber != "" {
+			line += " | " + c.AgreementNumber
+		}
+		if c.PaymentType != "" && c.PaymentType != "NONE" {
+			line += " | " + titleCase(c.PaymentType)
+		}
+		sb.WriteString(line + "\n")
+	}
+	sb.WriteString(warrantyNotesEnd)
+	block := sb.String()
+
+	existing := asset.Notes
+	start := strings.Index(existing, warrantyNotesStart)
+	end := strings.Index(existing, warrantyNotesEnd)
+	if start >= 0 && end >= 0 {
+		// Replace existing block in place
+		asset.Notes = strings.TrimSpace(existing[:start]) + "\n\n" + block
+		if tail := strings.TrimSpace(existing[end+len(warrantyNotesEnd):]); tail != "" {
+			asset.Notes += "\n\n" + tail
+		}
+	} else {
+		// Append block
+		if existing != "" {
+			asset.Notes = strings.TrimSpace(existing) + "\n\n" + block
+		} else {
+			asset.Notes = block
 		}
 	}
 }

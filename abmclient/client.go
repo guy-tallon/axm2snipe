@@ -225,16 +225,32 @@ func (c *Client) GetAllPurchaseSources(ctx context.Context) ([]PurchaseSource, e
 	return sources, nil
 }
 
-// GetAppleCareCoverage fetches AppleCare coverage for a device,
-// returning a flattened struct or nil if no coverage exists.
-func (c *Client) GetAppleCareCoverage(ctx context.Context, deviceID string) (*AppleCareCoverage, error) {
+// CoverageResult holds both the "winning" AppleCare record and the full list
+// of all coverage records for a device.
+type CoverageResult struct {
+	Best *AppleCareCoverage   // selected by priority rules (may be nil)
+	All  []AppleCareCoverage  // all records, including Limited Warranty
+}
+
+// GetAppleCareCoverage fetches AppleCare coverage for a device.
+// It returns a CoverageResult with all records and the best one selected by
+// priority: ACTIVE > PAID_UP_FRONT payment type > latest end date.
+func (c *Client) GetAppleCareCoverage(ctx context.Context, deviceID string) (*CoverageResult, error) {
 	resp, err := c.abm.GetOrgDeviceAppleCareCoverage(ctx, deviceID, nil)
 	if err != nil {
 		return nil, err
 	}
-	if len(resp.Data) > 0 && resp.Data[0].Attributes != nil {
-		a := resp.Data[0].Attributes
-		return &AppleCareCoverage{
+
+	var all []AppleCareCoverage
+	var bestIdx int = -1
+	var best *abm.AppleCareCoverageAttributes
+
+	for i := range resp.Data {
+		a := resp.Data[i].Attributes
+		if a == nil {
+			continue
+		}
+		all = append(all, AppleCareCoverage{
 			AgreementNumber:        a.AgreementNumber,
 			ContractCancelDateTime: a.ContractCancelDateTime,
 			Description:            a.Description,
@@ -244,7 +260,47 @@ func (c *Client) GetAppleCareCoverage(ctx context.Context, deviceID string) (*Ap
 			PaymentType:            string(a.PaymentType),
 			StartDateTime:          a.StartDateTime,
 			Status:                 string(a.Status),
-		}, nil
+		})
+		if best == nil {
+			best = a
+			bestIdx = len(all) - 1
+			continue
+		}
+		// Prefer ACTIVE over non-ACTIVE
+		bestActive := string(best.Status) == "ACTIVE"
+		aActive := string(a.Status) == "ACTIVE"
+		if aActive && !bestActive {
+			best = a
+			bestIdx = len(all) - 1
+			continue
+		}
+		if bestActive && !aActive {
+			continue
+		}
+		// Both same activity status: prefer paid coverage over free/none
+		bestPaid := string(best.PaymentType) == "PAID_UP_FRONT"
+		aPaid := string(a.PaymentType) == "PAID_UP_FRONT"
+		if aPaid && !bestPaid {
+			best = a
+			bestIdx = len(all) - 1
+			continue
+		}
+		if bestPaid && !aPaid {
+			continue
+		}
+		// Final tiebreaker: prefer later end date
+		if a.EndDateTime.After(best.EndDateTime) {
+			best = a
+			bestIdx = len(all) - 1
+		}
 	}
-	return nil, nil
+
+	if len(all) == 0 {
+		return nil, nil
+	}
+	result := &CoverageResult{All: all}
+	if bestIdx >= 0 {
+		result.Best = &all[bestIdx]
+	}
+	return result, nil
 }
