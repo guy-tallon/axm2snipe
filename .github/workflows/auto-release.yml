@@ -1,0 +1,140 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  auto-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine next version
+        id: version
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            echo "No existing tags found, skipping release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SINCE=$(git log -1 --format=%aI "${PREV_TAG}")
+          export SINCE
+
+          # Check if there are any merged PRs since the last tag
+          PR_COUNT=$(gh pr list \
+            --repo "${REPO}" \
+            --state merged \
+            --search "merged:>=${SINCE}" \
+            --json number \
+            --limit 100 | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+
+          if [ "$PR_COUNT" -eq 0 ]; then
+            echo "No merged PRs since ${PREV_TAG}, skipping release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Ask Claude to determine bump type from PR contents
+          BUMP=$(python3 - "$PREV_TAG" <<'PYEOF'
+          import sys, os, json, urllib.request, subprocess
+
+          prev_tag = sys.argv[1]
+          since = os.environ["SINCE"]
+          repo = os.environ["REPO"]
+
+          prs_json = subprocess.run(
+              ["gh", "pr", "list", "--repo", repo,
+               "--state", "merged",
+               "--search", f"merged:>={since}",
+               "--json", "number,title,body",
+               "--limit", "100"],
+              capture_output=True, text=True
+          ).stdout
+          prs = json.loads(prs_json) if prs_json.strip() else []
+
+          pr_text = "\n\n".join(
+              f"PR #{pr['number']}: {pr['title']}\n{(pr['body'] or '').strip()}"
+              for pr in prs
+          )
+
+          prompt = f"""You are a semantic versioning expert. Given the following merged pull requests for a Go CLI tool (axm2snipe), determine the appropriate semver bump type.
+
+          Current version: {prev_tag}
+
+          Merged pull requests:
+          {pr_text}
+
+          Semver rules:
+          - MAJOR: breaking changes, removed features, incompatible config/API changes
+          - MINOR: new features, new commands, new config options (backwards compatible)
+          - PATCH: bug fixes, performance improvements, docs, tests, refactoring (no new features)
+
+          Respond with exactly one word: MAJOR, MINOR, or PATCH."""
+
+          payload = {
+              "model": "claude-haiku-4-5-20251001",
+              "max_tokens": 10,
+              "messages": [{"role": "user", "content": prompt}]
+          }
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json",
+              },
+              method="POST"
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+          print(data["content"][0]["text"].strip().upper())
+          PYEOF
+          )
+
+          # Validate bump type
+          if [ "$BUMP" != "MAJOR" ] && [ "$BUMP" != "MINOR" ] && [ "$BUMP" != "PATCH" ]; then
+            echo "Unexpected bump type from Claude: ${BUMP}, defaulting to PATCH"
+            BUMP="PATCH"
+          fi
+
+          # Parse current version and compute next
+          VERSION="${PREV_TAG#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+          case "$BUMP" in
+            MAJOR) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            MINOR) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            PATCH) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEXT_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "next_tag=${NEXT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${PREV_TAG} -> ${NEXT_TAG} (${BUMP})"
+
+      - name: Tag and push
+        if: steps.version.outputs.skip == 'false'
+        env:
+          NEXT_TAG: ${{ steps.version.outputs.next_tag }}
+        run: |
+          git tag "${NEXT_TAG}"
+          git push origin "${NEXT_TAG}"
