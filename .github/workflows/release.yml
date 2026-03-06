@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -28,8 +30,112 @@ jobs:
           GOOS=linux   GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o "dist/axm2snipe-linux-arm64"    .
           GOOS=windows GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o "dist/axm2snipe-windows-amd64.exe" .
 
+      - name: Generate release notes
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VERSION: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${VERSION}$" | head -1)
+
+          # Get the date of the previous tag so we can filter PRs merged after it
+          if [ -n "$PREV_TAG" ]; then
+            SINCE=$(git log -1 --format=%aI "${PREV_TAG}")
+          else
+            SINCE="1970-01-01T00:00:00Z"
+          fi
+
+          export SINCE
+          python3 - "$VERSION" "$PREV_TAG" <<PYEOF > release_notes.md
+          import sys, os, json, urllib.request, subprocess
+
+          version = sys.argv[1]
+          prev = sys.argv[2]
+
+          prs_json = subprocess.run(
+              ["gh", "pr", "list", "--repo", os.environ["REPO"],
+               "--state", "merged",
+               "--search", f"merged:>={os.environ['SINCE']}",
+               "--json", "number,title,author,body,mergedAt",
+               "--limit", "100"],
+              capture_output=True, text=True
+          ).stdout
+          prs = json.loads(prs_json) if prs_json.strip() else []
+
+          # Collect unique contributors (excluding bots)
+          contributors = sorted({
+              pr["author"]["login"]
+              for pr in prs
+              if pr["author"]["login"] and not pr["author"]["login"].endswith("[bot]")
+          })
+
+          # Build PR summary lines
+          pr_lines = "\n".join(
+              f"- #{pr['number']}: {pr['title']} (@{pr['author']['login']})"
+              for pr in sorted(prs, key=lambda p: p["number"])
+          )
+
+          # Check if there were contributors in previous releases to identify new ones
+          all_time_json = subprocess.run(
+              ["gh", "pr", "list", "--repo", os.environ["REPO"],
+               "--state", "merged",
+               "--search", f"merged:<{os.environ['SINCE']}",
+               "--json", "author",
+               "--limit", "500"],
+              capture_output=True, text=True
+          ).stdout
+          prev_prs = json.loads(all_time_json) if all_time_json.strip() else []
+          prev_contributors = {p["author"]["login"] for p in prev_prs}
+          new_contributors = [c for c in contributors if c not in prev_contributors]
+
+          prompt = f"""You are writing GitHub release notes for axm2snipe, a Go CLI tool that syncs Apple Business Manager (ABM/ASM) devices into Snipe-IT asset management.
+
+          New version: {version}
+          Previous version: {prev if prev else "first release"}
+          Repository: https://github.com/{os.environ['REPO']}
+
+          Merged pull requests in this release:
+          {pr_lines if pr_lines else "(no PRs found — use git history context)"}
+
+          Contributors in this release: {', '.join(f'@{c}' for c in contributors)}
+          New contributors (first-time): {', '.join(f'@{c}' for c in new_contributors) if new_contributors else 'none'}
+
+          Write concise, user-facing release notes in GitHub Markdown following this structure exactly:
+
+          ## What's New
+          (grouped bullet points by theme, written from a user perspective, referencing PR numbers as links like [#123](url) and @author)
+
+          ## Contributors
+          (bullet list of all contributors as @username GitHub profile links; mark first-time contributors with 🎉)
+
+          **Full Changelog**: https://github.com/{os.environ['REPO']}/compare/{prev}...{version}
+
+          Be specific but brief. Do not invent features not present in the PR list."""
+
+          payload = {{
+              "model": "claude-haiku-4-5-20251001",
+              "max_tokens": 1024,
+              "messages": [{{"role": "user", "content": prompt}}]
+          }}
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=json.dumps(payload).encode(),
+              headers={{
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json",
+              }},
+              method="POST"
+          )
+          with urllib.request.urlopen(req) as resp:
+              data = json.loads(resp.read())
+          print(data["content"][0]["text"])
+          PYEOF
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release_notes.md
           files: dist/*
