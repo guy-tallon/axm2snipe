@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -300,18 +301,22 @@ func TestApplyFieldMapping(t *testing.T) {
 		AssignedServer: "TestMDM",
 	}
 
-	ac := &abmclient.AppleCareCoverage{
+	acRecord := abmclient.AppleCareCoverage{
 		Status:        "ACTIVE",
 		StartDateTime: acStart,
 		EndDateTime:   acEnd,
-		PaymentType:   "Paid_up_front",
+		PaymentType:   "PAID_UP_FRONT",
 		IsRenewable:   true,
+	}
+	coverage := &abmclient.CoverageResult{
+		Best: &acRecord,
+		All:  []abmclient.AppleCareCoverage{acRecord},
 	}
 
 	asset := snipeit.Asset{
 		CommonFields: snipeit.CommonFields{CustomFields: make(map[string]string)},
 	}
-	e.applyFieldMapping(&asset, device, ac)
+	e.applyFieldMapping(&asset, device, coverage)
 
 	checks := map[string]string{
 		"_snipeit_color_1":   "Space Gray",
@@ -702,10 +707,11 @@ func TestCacheRoundTrip(t *testing.T) {
 		makeDevice("D2", "SN002", "Mac", "Mac14,7"),
 	}
 
-	appleCare := map[string]*abmclient.AppleCareCoverage{
+	acRecord := abmclient.AppleCareCoverage{Status: "ACTIVE", Description: "AppleCare+ for Mac"}
+	appleCare := map[string]*abmclient.CoverageResult{
 		"D1": {
-			Status:      "ACTIVE",
-			Description: "AppleCare+ for Mac",
+			Best: &acRecord,
+			All:  []abmclient.AppleCareCoverage{acRecord},
 		},
 	}
 
@@ -732,8 +738,8 @@ func TestCacheRoundTrip(t *testing.T) {
 	if e.cache.Devices[0].Attributes.SerialNumber != "SN001" {
 		t.Errorf("device serial = %q, want SN001", e.cache.Devices[0].Attributes.SerialNumber)
 	}
-	if e.cache.AppleCare["D1"].Status != "ACTIVE" {
-		t.Errorf("AppleCare status = %q, want ACTIVE", e.cache.AppleCare["D1"].Status)
+	if e.cache.AppleCare["D1"].Best.Status != "ACTIVE" {
+		t.Errorf("AppleCare status = %q, want ACTIVE", e.cache.AppleCare["D1"].Best.Status)
 	}
 }
 
@@ -791,6 +797,116 @@ func TestFormatAssetDiff(t *testing.T) {
 	}
 	if m["_snipeit_color_1"] != "Silver" {
 		t.Errorf("_snipeit_color_1 = %v, want Silver", m["_snipeit_color_1"])
+	}
+}
+
+// --- applyWarrantyNotes tests ---
+
+func TestApplyWarrantyNotes_PreservesManualNotes(t *testing.T) {
+	ac := abmclient.AppleCareCoverage{
+		Status:          "ACTIVE",
+		Description:     "AppleCare+ for Mac",
+		AgreementNumber: "123456",
+		PaymentType:     "PAID_UP_FRONT",
+	}
+	coverage := &abmclient.CoverageResult{
+		Best: &ac,
+		All:  []abmclient.AppleCareCoverage{ac},
+	}
+
+	// First apply: no existing notes
+	asset := &snipeit.Asset{}
+	applyWarrantyNotes(asset, coverage)
+	if !strings.Contains(asset.Notes, warrantyNotesStart) {
+		t.Error("expected warranty sentinel start in notes")
+	}
+	if !strings.Contains(asset.Notes, "AppleCare+ for Mac") {
+		t.Error("expected coverage description in notes")
+	}
+
+	// Second apply: manual notes before and after existing sentinel block
+	asset.Notes = "Manual note before.\n\n" + asset.Notes + "\n\nManual note after."
+	applyWarrantyNotes(asset, coverage)
+
+	if !strings.HasPrefix(asset.Notes, "Manual note before.") {
+		t.Errorf("manual prefix lost; notes = %q", asset.Notes)
+	}
+	if !strings.Contains(asset.Notes, "Manual note after.") {
+		t.Errorf("manual suffix lost; notes = %q", asset.Notes)
+	}
+	// Sentinel block should appear exactly once
+	if strings.Count(asset.Notes, warrantyNotesStart) != 1 {
+		t.Errorf("expected exactly one sentinel start, got %d; notes = %q",
+			strings.Count(asset.Notes, warrantyNotesStart), asset.Notes)
+	}
+}
+
+func TestApplyWarrantyNotes_ReplaceBlockAtStart(t *testing.T) {
+	// Block at position 0 (no manual notes before it) — replacement must not
+	// produce a leading "\n\n" prefix, and re-applying must be idempotent.
+	ac := abmclient.AppleCareCoverage{Status: "ACTIVE", Description: "AppleCare+"}
+	coverage := &abmclient.CoverageResult{Best: &ac, All: []abmclient.AppleCareCoverage{ac}}
+
+	asset := &snipeit.Asset{}
+	applyWarrantyNotes(asset, coverage)
+	firstNotes := asset.Notes
+
+	// Simulate a second sync: block already present, nothing before it.
+	applyWarrantyNotes(asset, coverage)
+
+	if asset.Notes != firstNotes {
+		t.Errorf("re-apply changed notes\ngot:  %q\nwant: %q", asset.Notes, firstNotes)
+	}
+	if strings.HasPrefix(asset.Notes, "\n") {
+		t.Errorf("notes must not start with newline; got %q", asset.Notes)
+	}
+}
+
+func TestApplyWarrantyNotes_NilCoverageRemovesBlock(t *testing.T) {
+	// Build notes that contain a sentinel block flanked by manual text.
+	existing := "Manual before.\n\n" + warrantyNotesStart + "\n[Active] AppleCare+ for Mac\n" + warrantyNotesEnd + "\n\nManual after."
+	asset := &snipeit.Asset{}
+	asset.Notes = existing
+
+	applyWarrantyNotes(asset, nil)
+
+	if strings.Contains(asset.Notes, warrantyNotesStart) {
+		t.Errorf("sentinel block should be removed when coverage is nil; notes = %q", asset.Notes)
+	}
+	if !strings.Contains(asset.Notes, "Manual before.") {
+		t.Errorf("manual prefix lost; notes = %q", asset.Notes)
+	}
+	if !strings.Contains(asset.Notes, "Manual after.") {
+		t.Errorf("manual suffix lost; notes = %q", asset.Notes)
+	}
+}
+
+func TestApplyWarrantyNotes_NilCoverageNoBlock(t *testing.T) {
+	asset := &snipeit.Asset{}
+	asset.Notes = "Just a manual note."
+	applyWarrantyNotes(asset, nil)
+	if asset.Notes != "Just a manual note." {
+		t.Errorf("notes should be unchanged; got %q", asset.Notes)
+	}
+}
+
+func TestFormatAssetDiff_IncludesNotes(t *testing.T) {
+	a := &snipeit.Asset{
+		CommonFields: snipeit.CommonFields{
+			CustomFields: make(map[string]string),
+		},
+	}
+	a.Notes = "some notes"
+	m := formatAssetDiff(a)
+	if m["notes"] != "some notes" {
+		t.Errorf("notes = %v, want %q", m["notes"], "some notes")
+	}
+
+	// Notes absent when empty
+	a2 := &snipeit.Asset{CommonFields: snipeit.CommonFields{CustomFields: make(map[string]string)}}
+	m2 := formatAssetDiff(a2)
+	if _, ok := m2["notes"]; ok {
+		t.Error("notes key should be absent when empty")
 	}
 }
 
