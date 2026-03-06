@@ -4,29 +4,32 @@ import sys
 import os
 import json
 import urllib.request
+import urllib.error
 import subprocess
 
 prev_tag = sys.argv[1]
 since = os.environ["SINCE"]
 repo = os.environ["REPO"]
 
-
-def run_gh(*args):
-    result = subprocess.run(["gh"] + list(args), capture_output=True, text=True)
-    try:
-        data = json.loads(result.stdout) if result.stdout.strip() else []
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, ValueError):
-        return []
-
-
-prs = run_gh(
-    "pr", "list", "--repo", repo,
-    "--state", "merged",
-    "--search", "merged:>=" + since,
-    "--json", "number,title,body",
-    "--limit", "100",
+result = subprocess.run(
+    ["gh", "pr", "list", "--repo", repo,
+     "--state", "merged",
+     "--search", "merged:>=" + since,
+     "--json", "number,title,body",
+     "--limit", "100"],
+    capture_output=True, text=True
 )
+if result.returncode != 0:
+    print("Could not fetch PRs: " + result.stderr.strip(), file=sys.stderr)
+    print("PATCH")
+    sys.exit(0)
+
+try:
+    prs = json.loads(result.stdout) if result.stdout.strip() else []
+    if not isinstance(prs, list):
+        prs = []
+except (json.JSONDecodeError, ValueError):
+    prs = []
 
 if not prs:
     print("NONE")
@@ -55,16 +58,21 @@ payload = {
     "messages": [{"role": "user", "content": prompt}],
 }
 
-req = urllib.request.Request(
-    "https://api.anthropic.com/v1/messages",
-    data=json.dumps(payload).encode(),
-    headers={
-        "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    },
-    method="POST",
-)
-with urllib.request.urlopen(req) as resp:
-    data = json.loads(resp.read())
-print(data["content"][0]["text"].strip().upper())
+try:
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode(),
+        headers={
+            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    text = data.get("content", [{}])[0].get("text", "PATCH").strip().upper()
+    print(text if text in ("MAJOR", "MINOR", "PATCH") else "PATCH")
+except Exception as e:
+    print("API error: " + str(e), file=sys.stderr)
+    print("PATCH")

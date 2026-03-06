@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -82,3 +86,11 @@ jobs:
         run: |
           git tag "${NEXT_TAG}"
           git push origin "${NEXT_TAG}"
+
+      - name: Trigger release workflow
+        if: steps.version.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_TAG: ${{ steps.version.outputs.next_tag }}
+        run: |
+          gh workflow run release.yml --ref "${NEXT_TAG}"
