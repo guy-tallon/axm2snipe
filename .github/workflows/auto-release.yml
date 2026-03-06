@@ -1,0 +1,110 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: read
+  actions: write
+
+jobs:
+  auto-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine next version
+        id: version
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            echo "No existing tags found, skipping release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! echo "${PREV_TAG}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "PREV_TAG ${PREV_TAG} is not valid semver (expected vX.Y.Z), skipping release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SINCE=$(git log -1 --format=%aI "${PREV_TAG}")
+          export SINCE
+
+          # Check if there are any merged PRs since the last tag
+          PR_COUNT=$(gh pr list \
+            --repo "${REPO}" \
+            --state merged \
+            --base main \
+            --search "merged:>=${SINCE}" \
+            --json number \
+            --limit 100 | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+
+          if [ "$PR_COUNT" -eq 0 ]; then
+            echo "No merged PRs since ${PREV_TAG}, skipping release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Ask Claude to determine bump type from PR contents
+          if ! BUMP=$(python3 .github/scripts/determine_bump.py "$PREV_TAG"); then
+            echo "determine_bump.py failed, skipping release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate bump type
+          if [ "$BUMP" != "MAJOR" ] && [ "$BUMP" != "MINOR" ] && [ "$BUMP" != "PATCH" ]; then
+            echo "Unexpected bump type from Claude: ${BUMP}, skipping release"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Parse current version and compute next
+          VERSION="${PREV_TAG#v}"
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+          case "$BUMP" in
+            MAJOR) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            MINOR) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            PATCH) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEXT_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "next_tag=${NEXT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "bump=${BUMP}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${PREV_TAG} -> ${NEXT_TAG} (${BUMP})"
+
+      - name: Tag and push
+        if: steps.version.outputs.skip == 'false'
+        env:
+          NEXT_TAG: ${{ steps.version.outputs.next_tag }}
+        run: |
+          git tag "${NEXT_TAG}"
+          git push origin "${NEXT_TAG}"
+
+      - name: Trigger release workflow
+        if: steps.version.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_TAG: ${{ steps.version.outputs.next_tag }}
+        run: |
+          gh workflow run release.yml --ref "${NEXT_TAG}" -f tag="${NEXT_TAG}"
