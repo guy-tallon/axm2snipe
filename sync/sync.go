@@ -106,6 +106,20 @@ func (e *Engine) FetchAndSaveCache(ctx context.Context) error {
 	// Filter by product family if configured
 	devices = e.filterByProductFamily(devices)
 
+	// Filter out devices not assigned to an MDM server if configured
+	if e.cfg.Sync.MDMOnly && e.cfg.Sync.MDMOnlyCache {
+		var filtered []abmclient.Device
+		for _, d := range devices {
+			if d.AssignedServer != "" {
+				filtered = append(filtered, d)
+			}
+		}
+		log.Infof("Filtered to %d devices assigned to MDM (from %d total)", len(filtered), len(devices))
+		devices = filtered
+	} else if e.cfg.Sync.MDMOnlyCache && !e.cfg.Sync.MDMOnly {
+		log.Warn("sync.mdm_only_cache is enabled but sync.mdm_only is false; cache filtering will be skipped")
+	}
+
 	// Save devices immediately
 	if err := writeJSON(cacheDir, "devices.json", devices); err != nil {
 		return fmt.Errorf("writing devices cache: %w", err)
@@ -451,6 +465,13 @@ func (e *Engine) processDevice(ctx context.Context, device abmclient.Device) err
 	}
 
 	logger := log.WithField("serial", serial)
+
+	// Skip devices not assigned to an MDM server if configured
+	if e.cfg.Sync.MDMOnly && device.AssignedServer == "" {
+		logger.Info("Skipping device not assigned to any MDM server (mdm_only mode)")
+		e.stats.Skipped++
+		return nil
+	}
 
 	// Look up asset in Snipe-IT by serial first to decide create vs update
 	existing, err := e.snipe.GetAssetBySerial(ctx, serial)
