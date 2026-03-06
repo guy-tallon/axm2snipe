@@ -78,7 +78,7 @@ jobs:
 
           # Build PR summary lines
           pr_lines = "\n".join(
-              f"- #{pr['number']}: {pr['title']} (@{pr['author']['login']})"
+              f"- #{pr['number']}: {pr['title']} (@{pr['author']['login'] if pr.get('author') and pr['author'].get('login') else 'unknown'})"
               for pr in sorted(prs, key=lambda p: p["number"])
           )
 
