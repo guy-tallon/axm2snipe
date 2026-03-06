@@ -841,6 +841,27 @@ func TestApplyWarrantyNotes_PreservesManualNotes(t *testing.T) {
 	}
 }
 
+func TestApplyWarrantyNotes_ReplaceBlockAtStart(t *testing.T) {
+	// Block at position 0 (no manual notes before it) — replacement must not
+	// produce a leading "\n\n" prefix, and re-applying must be idempotent.
+	ac := abmclient.AppleCareCoverage{Status: "ACTIVE", Description: "AppleCare+"}
+	coverage := &abmclient.CoverageResult{Best: &ac, All: []abmclient.AppleCareCoverage{ac}}
+
+	asset := &snipeit.Asset{}
+	applyWarrantyNotes(asset, coverage)
+	firstNotes := asset.Notes
+
+	// Simulate a second sync: block already present, nothing before it.
+	applyWarrantyNotes(asset, coverage)
+
+	if asset.Notes != firstNotes {
+		t.Errorf("re-apply changed notes\ngot:  %q\nwant: %q", asset.Notes, firstNotes)
+	}
+	if strings.HasPrefix(asset.Notes, "\n") {
+		t.Errorf("notes must not start with newline; got %q", asset.Notes)
+	}
+}
+
 func TestApplyWarrantyNotes_NilCoverageRemovesBlock(t *testing.T) {
 	// Build notes that contain a sentinel block flanked by manual text.
 	existing := "Manual before.\n\n" + warrantyNotesStart + "\n[Active] AppleCare+ for Mac\n" + warrantyNotesEnd + "\n\nManual after."

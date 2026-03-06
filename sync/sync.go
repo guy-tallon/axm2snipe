@@ -1029,9 +1029,17 @@ func applyWarrantyNotes(asset *snipeit.Asset, coverage *abmclient.CoverageResult
 		if endIdx >= 0 {
 			endIdx += startIdx // make absolute
 			// Replace existing block in place
-			asset.Notes = strings.TrimSpace(existing[:startIdx]) + "\n\n" + block
-			if tail := strings.TrimSpace(existing[endIdx+len(warrantyNotesEnd):]); tail != "" {
-				asset.Notes += "\n\n" + tail
+			before := strings.TrimSpace(existing[:startIdx])
+			tail := strings.TrimSpace(existing[endIdx+len(warrantyNotesEnd):])
+			switch {
+			case before != "" && tail != "":
+				asset.Notes = before + "\n\n" + block + "\n\n" + tail
+			case before != "":
+				asset.Notes = before + "\n\n" + block
+			case tail != "":
+				asset.Notes = block + "\n\n" + tail
+			default:
+				asset.Notes = block
 			}
 			return
 		}
